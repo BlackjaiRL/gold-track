@@ -1,7 +1,6 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
-// const path = require("path");
 const { connectMySQL } = require("./db/mysql");
 
 const authRoutes = require("./routes/auth");
@@ -13,14 +12,32 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://gold-tracker-psi.vercel.app",
+  process.env.CORS_ORIGIN,
+].filter(Boolean);
+
+console.log("CORS_ORIGIN env:", process.env.CORS_ORIGIN);
+console.log("Allowed origins:", allowedOrigins);
+
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN || "http://localhost:5173",
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      console.log("Blocked by CORS:", origin);
+      return callback(new Error(`Not allowed by CORS: ${origin}`));
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
 
+app.options("*", cors());
+
 app.use(express.json());
-// app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/gold", goldRoutes);
