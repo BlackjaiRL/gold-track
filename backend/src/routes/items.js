@@ -1,29 +1,45 @@
 const express = require("express");
 const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
 const axios = require("axios");
+const { v2: cloudinary } = require("cloudinary");
 const { requireAuth } = require("../middleware/auth");
 const { getPool } = require("../db/mysql");
 
 const router = express.Router();
 
-const uploadDir = path.join(__dirname, "..", "uploads");
-fs.mkdirSync(uploadDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadDir),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
-  },
+/**
+ * Cloudinary config
+ */
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-const upload = multer({ storage });
+/**
+ * Multer in-memory storage
+ * This avoids saving files to Railway local disk.
+ */
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10 MB
+  },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype && file.mimetype.startsWith("image/")) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only image uploads are allowed"));
+    }
+  },
+});
 
 const GOLD_URL =
   "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD";
 
+/**
+ * Extract current gold price
+ */
 function extractPrice(data) {
   const item = Array.isArray(data) ? data[0] : data;
   return Number(
@@ -35,6 +51,33 @@ function extractPrice(data) {
   );
 }
 
+/**
+ * Upload a file buffer to Cloudinary
+ */
+function uploadBufferToCloudinary(buffer, options = {}) {
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        folder: "gold-track",
+        resource_type: "image",
+        ...options,
+      },
+      (error, result) => {
+        if (error) {
+          return reject(error);
+        }
+        resolve(result);
+      },
+    );
+
+    uploadStream.end(buffer);
+  });
+}
+
+/**
+ * POST /api/items
+ * Upload image to Cloudinary and save item to DB
+ */
 router.post("/", requireAuth, upload.single("image"), async (req, res) => {
   try {
     const grams = Number(req.body.grams);
@@ -43,27 +86,40 @@ router.post("/", requireAuth, upload.single("image"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: "Image is required" });
     }
-    if (!grams || grams <= 0) {
+
+    if (!Number.isFinite(grams) || grams <= 0) {
       return res.status(400).json({ error: "Valid grams value is required" });
     }
+
     if (!Number.isFinite(buyPriceTotal) || buyPriceTotal < 0) {
       return res.status(400).json({ error: "Valid buy price is required" });
     }
+
+    const uploaded = await uploadBufferToCloudinary(req.file.buffer, {
+      folder: `gold-track/user-${req.user.id}`,
+    });
+
     const priceResponse = await axios.get(GOLD_URL, { timeout: 10000 });
     const xauUsd = extractPrice(priceResponse.data);
+
+    if (!Number.isFinite(xauUsd) || xauUsd <= 0) {
+      throw new Error("Failed to retrieve valid gold price");
+    }
+
     const usdPerGram = xauUsd / 31.1034768;
     const estimatedValueUsd = +(grams * usdPerGram).toFixed(2);
+    const profitLoss = +(estimatedValueUsd - buyPriceTotal).toFixed(2);
 
     const pool = getPool();
-    const imagePath = `/uploads/${req.file.filename}`;
 
     const [result] = await pool.query(
       `INSERT INTO gold_items
-      (user_id, image_path, grams, buy_price_total, price_per_gram_usd, estimated_value_usd)
-      VALUES (?, ?, ?, ?, ?, ?)`,
+      (user_id, image_path, image_public_id, grams, buy_price_total, price_per_gram_usd, estimated_value_usd)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         req.user.id,
-        imagePath,
+        uploaded.secure_url,
+        uploaded.public_id,
         grams,
         buyPriceTotal,
         usdPerGram,
@@ -71,28 +127,43 @@ router.post("/", requireAuth, upload.single("image"), async (req, res) => {
       ],
     );
 
-    const profitLoss = +(estimatedValueUsd - buyPriceTotal).toFixed(2);
-
     res.json({
       id: result.insertId,
-      imagePath,
+      imagePath: uploaded.secure_url,
+      imagePublicId: uploaded.public_id,
       grams,
       buyPriceTotal,
       pricePerGramUsd: usdPerGram,
       estimatedValueUsd,
       profitLoss,
+      createdAt: new Date().toISOString(),
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to save item" });
+    console.error("POST /api/items error:", err);
+    res.status(500).json({
+      error: err.message || "Failed to save item",
+    });
   }
 });
 
+/**
+ * GET /api/items
+ * Fetch items for the logged-in user
+ */
 router.get("/", requireAuth, async (req, res) => {
   try {
     const pool = getPool();
+
     const [rows] = await pool.query(
-      `SELECT id, image_path, grams, buy_price_total, price_per_gram_usd, estimated_value_usd, created_at
+      `SELECT
+         id,
+         image_path,
+         image_public_id,
+         grams,
+         buy_price_total,
+         price_per_gram_usd,
+         estimated_value_usd,
+         created_at
        FROM gold_items
        WHERE user_id = ?
        ORDER BY created_at DESC`,
@@ -100,31 +171,44 @@ router.get("/", requireAuth, async (req, res) => {
     );
 
     const items = rows.map((item) => ({
-      ...item,
-      profit_loss: +(
+      id: item.id,
+      imagePath: item.image_path,
+      imagePublicId: item.image_public_id,
+      grams: Number(item.grams),
+      buyPriceTotal: Number(item.buy_price_total),
+      pricePerGramUsd: Number(item.price_per_gram_usd),
+      estimatedValueUsd: Number(item.estimated_value_usd),
+      profitLoss: +(
         Number(item.estimated_value_usd) - Number(item.buy_price_total)
       ).toFixed(2),
+      createdAt: item.created_at,
     }));
 
     res.json(items);
   } catch (err) {
-    console.error(err);
+    console.error("GET /api/items error:", err);
     res.status(500).json({ error: "Failed to fetch items" });
   }
 });
 
+/**
+ * DELETE /api/items/:id
+ * Delete DB row and Cloudinary image
+ */
 router.delete("/:id", requireAuth, async (req, res) => {
   try {
     const itemId = Number(req.params.id);
 
-    if (!itemId) {
+    if (!Number.isFinite(itemId) || itemId <= 0) {
       return res.status(400).json({ error: "Invalid item id" });
     }
 
     const pool = getPool();
 
     const [rows] = await pool.query(
-      "SELECT id, image_path FROM gold_items WHERE id = ? AND user_id = ?",
+      `SELECT id, image_public_id
+       FROM gold_items
+       WHERE id = ? AND user_id = ?`,
       [itemId, req.user.id],
     );
 
@@ -134,31 +218,28 @@ router.delete("/:id", requireAuth, async (req, res) => {
 
     const item = rows[0];
 
-    await pool.query("DELETE FROM gold_items WHERE id = ?", [itemId]);
-
-    if (item.image_path) {
-      const relativePath = item.image_path.startsWith("/")
-        ? item.image_path.slice(1)
-        : item.image_path;
-
-      const absolutePath = path.join(__dirname, "..", relativePath);
-
-      fs.unlink(absolutePath, (err) => {
-        if (err) {
-          console.error(
-            "Failed to delete image file:",
-            absolutePath,
-            err.message,
-          );
-        } else {
-          console.log("Deleted image file:", absolutePath);
-        }
-      });
+    if (item.image_public_id) {
+      try {
+        await cloudinary.uploader.destroy(item.image_public_id, {
+          resource_type: "image",
+        });
+      } catch (cloudErr) {
+        console.error(
+          "Cloudinary delete failed:",
+          item.image_public_id,
+          cloudErr.message,
+        );
+      }
     }
+
+    await pool.query("DELETE FROM gold_items WHERE id = ? AND user_id = ?", [
+      itemId,
+      req.user.id,
+    ]);
 
     res.json({ success: true });
   } catch (err) {
-    console.error(err);
+    console.error("DELETE /api/items/:id error:", err);
     res.status(500).json({ error: "Failed to delete item" });
   }
 });

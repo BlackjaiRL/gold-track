@@ -68,6 +68,7 @@ async function createTables() {
       id INT AUTO_INCREMENT PRIMARY KEY,
       user_id INT NOT NULL,
       image_path TEXT NOT NULL,
+      image_public_id VARCHAR(255) NULL,
       grams DECIMAL(10,2) NOT NULL,
       buy_price_total DECIMAL(12,2) NOT NULL DEFAULT 0,
       price_per_gram_usd DECIMAL(10,4) NOT NULL,
