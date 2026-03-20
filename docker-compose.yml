@@ -1,0 +1,47 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+    container_name: gold_track-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+    command: npm run dev -- --host 0.0.0.0
+
+  backend:
+    build:
+      context: ./backend
+    container_name: gold_track-backend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    depends_on:
+      - mariadb
+    env_file:
+      - ./backend/.env
+    command: npm run dev
+
+  mariadb:
+    image: mariadb:11
+    container_name: gold_track-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpassword
+      MARIADB_DATABASE: gold_track
+      MARIADB_USER: golduser
+      MARIADB_PASSWORD: goldpass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+
+volumes:
+  mariadb_data:
