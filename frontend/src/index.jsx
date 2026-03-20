@@ -18,7 +18,7 @@ function App() {
   return (
     <div className="container">
       <h1>Gold Track</h1>
-      <p>Frontend + Backend + MariaDB + Docker</p>
+      <p>Frontend + Backend + MySQL + Docker</p>
       <button onClick={checkBackend}>Check Backend</button>
       <pre>{message}</pre>
     </div>

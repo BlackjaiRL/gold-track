@@ -4,7 +4,7 @@ const path = require("path");
 const fs = require("fs");
 const axios = require("axios");
 const { requireAuth } = require("../middleware/auth");
-const { getPool } = require("../db/mariadb");
+const { getPool } = require("../db/mysql");
 
 const router = express.Router();
 
