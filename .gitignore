@@ -6,3 +6,4 @@ backend/src/uploads/
 dist/
 .vscode/
 .DS_Store
+.env.production

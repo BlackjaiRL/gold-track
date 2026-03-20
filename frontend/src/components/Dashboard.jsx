@@ -13,6 +13,7 @@ export default function Dashboard({ user, onLogout }) {
   const [loadingItems, setLoadingItems] = useState(false);
   const [uploading, setUploading] = useState(false);
   const { lang, changeLang, t } = useLanguage();
+  const backendBase = import.meta.env.VITE_API_BASE_URL.replace(/\/api$/, "");
 
   async function loadGoldPrice() {
     try {
@@ -156,7 +157,10 @@ export default function Dashboard({ user, onLogout }) {
             <button onClick={() => changeLang("zh")}>中文</button>
           </div>
           <h1>{t("title")}</h1>
-          <p>{t("welcome")}{user?.name ? `, ${user.name}` : ""}</p>
+          <p>
+            {t("welcome")}
+            {user?.name ? `, ${user.name}` : ""}
+          </p>
         </div>
 
         <button className="secondary-btn" onClick={onLogout}>
@@ -248,14 +252,14 @@ export default function Dashboard({ user, onLogout }) {
             {enrichedItems.map((item) => (
               <div key={item.id} className="item-card">
                 <img
-                  src={`http://localhost:3000${item.image_path}`}
+                  src={`${backendBase}${item.image_path}`}
                   alt="Gold item"
                   className="item-image"
                 />
-
                 <div className="item-info">
                   <p>
-                    <strong>{t("grams")}:</strong> {Number(item.grams).toFixed(2)}
+                    <strong>{t("grams")}:</strong>{" "}
+                    {Number(item.grams).toFixed(2)}
                   </p>
 
                   <p>
