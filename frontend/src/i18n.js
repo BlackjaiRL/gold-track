@@ -27,7 +27,9 @@ export const translations = {
     confirmDelete: "Delete this item?",
     Deleting: "Deleting item...",
     deleted: "Item deleted",
-    autoRefresh: "Auto refreshes every 60 seconds"
+    autoRefresh: "Auto refreshes every 60 seconds",
+    currency: "Currency",
+    storedasUSD: "Stored as USD: "
   },
 
   zh: {
@@ -58,6 +60,8 @@ export const translations = {
     confirmDelete: "確定刪除？",
     Deleting: "刪除中...",
     deleted: "已刪除",
-    autoRefresh: "每60秒自動刷新"
+    autoRefresh: "每60秒自動刷新",
+    currency: "貨幣",
+    storedasUSD: "自動轉換成美金: "
   }
 };

@@ -17,9 +17,8 @@ export default function Dashboard({ user, onLogout }) {
   const [selectedCurrency, setSelectedCurrency] = useState("USD");
   const [loadingRates, setLoadingRates] = useState(false);
 
-  const { lang, changeLang, t } = useLanguage();
+  const { changeLang, t } = useLanguage();
   const apiBase = import.meta.env.VITE_API_BASE_URL || "";
-  const backendBase = apiBase.replace(/\/api$/, "");
 
   async function loadGoldPrice() {
     try {
@@ -79,6 +78,16 @@ export default function Dashboard({ user, onLogout }) {
     return () => clearInterval(interval);
   }, []);
 
+  const exchangeRate = Number(rates[selectedCurrency] || 1);
+
+  function formatMoney(value, currency = selectedCurrency) {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency,
+      maximumFractionDigits: 2,
+    }).format(Number(value || 0));
+  }
+
   async function handleUpload(e) {
     e.preventDefault();
 
@@ -92,23 +101,27 @@ export default function Dashboard({ user, onLogout }) {
       return;
     }
 
-    if (buyPriceTotal === "" || Number(buyPriceTotal) < 0) {
+    const enteredBuyPrice = Number(buyPriceTotal);
+
+    if (!Number.isFinite(enteredBuyPrice) || enteredBuyPrice < 0) {
       setMessage(t("Pleaseenteravalidbuyprice"));
       return;
     }
 
     try {
       setUploading(true);
-      setMessage("Uploading item...");
+      setMessage(t("uploading"));
 
       const formData = new FormData();
       formData.append("image", image);
       formData.append("grams", grams);
-      formData.append("buyPriceTotal", buyPriceTotal);
+
+      const buyPriceUsd = +(enteredBuyPrice / exchangeRate).toFixed(2);
+      formData.append("buyPriceTotal", buyPriceUsd);
 
       const token = localStorage.getItem("token");
 
-      const response = await fetch(`${backendBase}/api/items`, {
+      const response = await fetch(`${apiBase}/items`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -122,7 +135,7 @@ export default function Dashboard({ user, onLogout }) {
         throw new Error(data.error || "Upload failed");
       }
 
-      setMessage("Item uploaded successfully");
+      setMessage(t("uploadSuccess"));
       setGrams("");
       setBuyPriceTotal("");
       setImage(null);
@@ -155,16 +168,6 @@ export default function Dashboard({ user, onLogout }) {
     } catch (err) {
       setMessage(err.message);
     }
-  }
-
-  const exchangeRate = Number(rates[selectedCurrency] || 1);
-
-  function formatMoney(value, currency = selectedCurrency) {
-    return new Intl.NumberFormat(undefined, {
-      style: "currency",
-      currency,
-      maximumFractionDigits: 2,
-    }).format(Number(value || 0));
   }
 
   const enrichedItems = useMemo(() => {
@@ -211,8 +214,14 @@ export default function Dashboard({ user, onLogout }) {
 
         <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
           <div>
-            <label style={{ display: "block", fontSize: "14px", marginBottom: "4px" }}>
-              Currency
+            <label
+              style={{
+                display: "block",
+                fontSize: "14px",
+                marginBottom: "4px",
+              }}
+            >
+              {t("currency")}
             </label>
             <select
               value={selectedCurrency}
@@ -242,7 +251,8 @@ export default function Dashboard({ user, onLogout }) {
           ) : goldData ? (
             <>
               <p>
-                <strong>XAU/USD:</strong> {formatMoney(Number(goldData.xauUsd), "USD")}
+                <strong>XAU/USD:</strong>{" "}
+                {formatMoney(Number(goldData.xauUsd), "USD")}
               </p>
 
               <p>
@@ -251,7 +261,9 @@ export default function Dashboard({ user, onLogout }) {
               </p>
 
               <p>
-                <strong>{t("currentPrice")} ({selectedCurrency}/g):</strong>{" "}
+                <strong>
+                  {t("currentPrice")} ({selectedCurrency}/g):
+                </strong>{" "}
                 {formatMoney(Number(goldData.usdPerGram || 0) * exchangeRate)}
               </p>
 
@@ -295,15 +307,26 @@ export default function Dashboard({ user, onLogout }) {
             </div>
 
             <div className="field">
-              <label>{t("buyPrice")} (USD)</label>
+              <label>
+                {t("buyPrice")} ({selectedCurrency})
+              </label>
               <input
                 type="number"
                 step="0.01"
                 value={buyPriceTotal}
                 onChange={(e) => setBuyPriceTotal(e.target.value)}
-                placeholder="e.g. 1200"
+                placeholder={`e.g. ${selectedCurrency === "USD" ? "1200" : "1800"}`}
                 required
               />
+              <p className="small-text">
+                {t("storedasUSD")}{" "}
+                {formatMoney(
+                  Number.isFinite(Number(buyPriceTotal))
+                    ? Number(buyPriceTotal) / exchangeRate
+                    : 0,
+                  "USD"
+                )}
+              </p>
             </div>
 
             <button className="primary-btn" type="submit" disabled={uploading}>
@@ -332,7 +355,8 @@ export default function Dashboard({ user, onLogout }) {
 
                 <div className="item-info">
                   <p>
-                    <strong>{t("grams")}:</strong> {Number(item.grams).toFixed(2)}
+                    <strong>{t("grams")}:</strong>{" "}
+                    {Number(item.grams).toFixed(2)}
                   </p>
 
                   <p>
@@ -358,7 +382,9 @@ export default function Dashboard({ user, onLogout }) {
                     <strong>{t("profitLoss")}:</strong>{" "}
                     <span
                       className={
-                        Number(item.live_profit_loss_converted) >= 0 ? "profit" : "loss"
+                        Number(item.live_profit_loss_converted) >= 0
+                          ? "profit"
+                          : "loss"
                       }
                     >
                       {formatMoney(item.live_profit_loss_converted)}
