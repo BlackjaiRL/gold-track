@@ -45,7 +45,7 @@ function extractPrice(data) {
 
 function getCloudreveHeaders(extra = {}) {
   return {
-    Authorization: `${CLOUDREVE_TOKEN}`,
+    Authorization: `Bearer ${CLOUDREVE_TOKEN}`,
     ...extra,
   };
 }
