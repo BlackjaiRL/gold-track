@@ -126,11 +126,8 @@ export default function Dashboard({ user, onLogout }) {
 
       const token = localStorage.getItem("token");
 
-      const response = await fetch(`${apiBase}/items`, {
+      const response = await apiFetch("/items", {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
         body: formData,
       });
 
