@@ -7,29 +7,30 @@ const { getPool } = require("../db/mysql");
 
 const router = express.Router();
 
-/**
- * Cloudinary config
- */
+if (
+  !process.env.CLOUDINARY_CLOUD_NAME ||
+  !process.env.CLOUDINARY_API_KEY ||
+  !process.env.CLOUDINARY_API_SECRET
+) {
+  throw new Error("Missing Cloudinary environment variables");
+}
+
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-/**
- * Multer in-memory storage
- * This avoids saving files to Railway local disk.
- */
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10 MB
+    fileSize: 10 * 1024 * 1024,
   },
   fileFilter: (_req, file, cb) => {
     if (file.mimetype && file.mimetype.startsWith("image/")) {
       cb(null, true);
     } else {
-      cb(new Error("Only image uploads are allowed"));
+      cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "image"));
     }
   },
 });
@@ -37,9 +38,6 @@ const upload = multer({
 const GOLD_URL =
   "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD";
 
-/**
- * Extract current gold price
- */
 function extractPrice(data) {
   const item = Array.isArray(data) ? data[0] : data;
   return Number(
@@ -47,13 +45,10 @@ function extractPrice(data) {
       item?.spreadProfilePrices?.[0]?.bid ??
       item?.ask ??
       item?.bid ??
-      item?.price,
+      item?.price
   );
 }
 
-/**
- * Upload a file buffer to Cloudinary
- */
 function uploadBufferToCloudinary(buffer, options = {}) {
   return new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
@@ -63,93 +58,94 @@ function uploadBufferToCloudinary(buffer, options = {}) {
         ...options,
       },
       (error, result) => {
-        if (error) {
-          return reject(error);
-        }
+        if (error) return reject(error);
         resolve(result);
-      },
+      }
     );
 
     uploadStream.end(buffer);
   });
 }
 
-/**
- * POST /api/items
- * Upload image to Cloudinary and save item to DB
- */
-router.post("/", requireAuth, upload.single("image"), async (req, res) => {
-  try {
-    const grams = Number(req.body.grams);
-    const buyPriceTotal = Number(req.body.buyPriceTotal);
+router.post("/", requireAuth, (req, res) => {
+  upload.single("image")(req, res, async (uploadErr) => {
+    try {
+      if (uploadErr) {
+        if (uploadErr instanceof multer.MulterError) {
+          if (uploadErr.code === "LIMIT_FILE_SIZE") {
+            return res.status(400).json({ error: "Image must be under 10MB" });
+          }
+          return res.status(400).json({ error: "Invalid image upload" });
+        }
+        return res.status(400).json({ error: uploadErr.message || "Upload failed" });
+      }
 
-    if (!req.file) {
-      return res.status(400).json({ error: "Image is required" });
-    }
+      const grams = Number(req.body.grams);
+      const buyPriceTotal = Number(req.body.buyPriceTotal);
 
-    if (!Number.isFinite(grams) || grams <= 0) {
-      return res.status(400).json({ error: "Valid grams value is required" });
-    }
+      if (!req.file) {
+        return res.status(400).json({ error: "Image is required" });
+      }
 
-    if (!Number.isFinite(buyPriceTotal) || buyPriceTotal < 0) {
-      return res.status(400).json({ error: "Valid buy price is required" });
-    }
+      if (!Number.isFinite(grams) || grams <= 0) {
+        return res.status(400).json({ error: "Valid grams value is required" });
+      }
 
-    const uploaded = await uploadBufferToCloudinary(req.file.buffer, {
-      folder: `gold-track/user-${req.user.id}`,
-    });
+      if (!Number.isFinite(buyPriceTotal) || buyPriceTotal < 0) {
+        return res.status(400).json({ error: "Valid buy price is required" });
+      }
 
-    const priceResponse = await axios.get(GOLD_URL, { timeout: 10000 });
-    const xauUsd = extractPrice(priceResponse.data);
+      const uploaded = await uploadBufferToCloudinary(req.file.buffer, {
+        folder: `gold-track/user-${req.user.id}`,
+      });
 
-    if (!Number.isFinite(xauUsd) || xauUsd <= 0) {
-      throw new Error("Failed to retrieve valid gold price");
-    }
+      const priceResponse = await axios.get(GOLD_URL, { timeout: 10000 });
+      const xauUsd = extractPrice(priceResponse.data);
 
-    const usdPerGram = xauUsd / 31.1034768;
-    const estimatedValueUsd = +(grams * usdPerGram).toFixed(2);
-    const profitLoss = +(estimatedValueUsd - buyPriceTotal).toFixed(2);
+      if (!Number.isFinite(xauUsd) || xauUsd <= 0) {
+        throw new Error("Failed to retrieve valid gold price");
+      }
 
-    const pool = getPool();
+      const usdPerGram = xauUsd / 31.1034768;
+      const estimatedValueUsd = +(grams * usdPerGram).toFixed(2);
+      const profitLoss = +(estimatedValueUsd - buyPriceTotal).toFixed(2);
 
-    const [result] = await pool.query(
-      `INSERT INTO gold_items
-      (user_id, image_path, image_public_id, grams, buy_price_total, price_per_gram_usd, estimated_value_usd)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        req.user.id,
-        uploaded.secure_url,
-        uploaded.public_id,
+      const pool = getPool();
+
+      const [result] = await pool.query(
+        `INSERT INTO gold_items
+        (user_id, image_path, image_public_id, grams, buy_price_total, price_per_gram_usd, estimated_value_usd)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          req.user.id,
+          uploaded.secure_url,
+          uploaded.public_id,
+          grams,
+          buyPriceTotal,
+          usdPerGram,
+          estimatedValueUsd,
+        ]
+      );
+
+      res.json({
+        id: result.insertId,
+        imagePath: uploaded.secure_url,
+        imagePublicId: uploaded.public_id,
         grams,
         buyPriceTotal,
-        usdPerGram,
+        pricePerGramUsd: usdPerGram,
         estimatedValueUsd,
-      ],
-    );
-
-    res.json({
-      id: result.insertId,
-      imagePath: uploaded.secure_url,
-      imagePublicId: uploaded.public_id,
-      grams,
-      buyPriceTotal,
-      pricePerGramUsd: usdPerGram,
-      estimatedValueUsd,
-      profitLoss,
-      createdAt: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error("POST /api/items error:", err);
-    res.status(500).json({
-      error: err.message || "Failed to save item",
-    });
-  }
+        profitLoss,
+      });
+    } catch (err) {
+      console.error("POST /api/items error:", err);
+      res.status(500).json({
+        error: err.message || "Failed to save item",
+      });
+    }
+  });
 });
 
-/**
- * GET /api/items
- * Fetch items for the logged-in user
- */
 router.get("/", requireAuth, async (req, res) => {
   try {
     const pool = getPool();
@@ -167,7 +163,7 @@ router.get("/", requireAuth, async (req, res) => {
        FROM gold_items
        WHERE user_id = ?
        ORDER BY created_at DESC`,
-      [req.user.id],
+      [req.user.id]
     );
 
     const items = rows.map((item) => ({
@@ -191,10 +187,6 @@ router.get("/", requireAuth, async (req, res) => {
   }
 });
 
-/**
- * DELETE /api/items/:id
- * Delete DB row and Cloudinary image
- */
 router.delete("/:id", requireAuth, async (req, res) => {
   try {
     const itemId = Number(req.params.id);
@@ -209,7 +201,7 @@ router.delete("/:id", requireAuth, async (req, res) => {
       `SELECT id, image_public_id
        FROM gold_items
        WHERE id = ? AND user_id = ?`,
-      [itemId, req.user.id],
+      [itemId, req.user.id]
     );
 
     if (!rows.length) {
@@ -227,7 +219,7 @@ router.delete("/:id", requireAuth, async (req, res) => {
         console.error(
           "Cloudinary delete failed:",
           item.image_public_id,
-          cloudErr.message,
+          cloudErr.message
         );
       }
     }

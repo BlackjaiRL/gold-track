@@ -12,8 +12,14 @@ export default function Dashboard({ user, onLogout }) {
   const [loadingPrice, setLoadingPrice] = useState(false);
   const [loadingItems, setLoadingItems] = useState(false);
   const [uploading, setUploading] = useState(false);
+
+  const [rates, setRates] = useState({ USD: 1 });
+  const [selectedCurrency, setSelectedCurrency] = useState("USD");
+  const [loadingRates, setLoadingRates] = useState(false);
+
   const { lang, changeLang, t } = useLanguage();
-  const backendBase = import.meta.env.VITE_API_BASE_URL.replace(/\/api$/, "");
+  const apiBase = import.meta.env.VITE_API_BASE_URL || "";
+  const backendBase = apiBase.replace(/\/api$/, "");
 
   async function loadGoldPrice() {
     try {
@@ -39,12 +45,35 @@ export default function Dashboard({ user, onLogout }) {
     }
   }
 
+  async function loadExchangeRates() {
+    try {
+      setLoadingRates(true);
+      const response = await fetch("https://open.er-api.com/v6/latest/USD");
+      const data = await response.json();
+
+      if (!response.ok || data.result === "error") {
+        throw new Error(data.error || "Failed to load exchange rates");
+      }
+
+      setRates({
+        USD: 1,
+        ...(data.rates || {}),
+      });
+    } catch (err) {
+      setMessage(err.message);
+    } finally {
+      setLoadingRates(false);
+    }
+  }
+
   useEffect(() => {
     loadGoldPrice();
     loadItems();
+    loadExchangeRates();
 
     const interval = setInterval(() => {
       loadGoldPrice();
+      loadExchangeRates();
     }, 60000);
 
     return () => clearInterval(interval);
@@ -79,7 +108,7 @@ export default function Dashboard({ user, onLogout }) {
 
       const token = localStorage.getItem("token");
 
-      const response = await fetch("http://localhost:3000/api/items", {
+      const response = await fetch(`${backendBase}/api/items`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -118,11 +147,9 @@ export default function Dashboard({ user, onLogout }) {
 
     try {
       setMessage(t("Deleting"));
-
       await apiFetch(`/items/${itemId}`, {
         method: "DELETE",
       });
-
       setMessage(t("deleted"));
       await loadItems();
     } catch (err) {
@@ -130,32 +157,51 @@ export default function Dashboard({ user, onLogout }) {
     }
   }
 
+  const exchangeRate = Number(rates[selectedCurrency] || 1);
+
+  function formatMoney(value, currency = selectedCurrency) {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency,
+      maximumFractionDigits: 2,
+    }).format(Number(value || 0));
+  }
+
   const enrichedItems = useMemo(() => {
     const currentUsdPerGram = Number(goldData?.usdPerGram || 0);
 
     return items.map((item) => {
       const itemGrams = Number(item.grams || 0);
-      const itemBuyPriceTotal = Number(item.buy_price_total || 0);
-      const currentValue = +(itemGrams * currentUsdPerGram).toFixed(2);
-      const profitLoss = +(currentValue - itemBuyPriceTotal).toFixed(2);
+      const itemBuyPriceUsd = Number(item.buyPriceTotal || 0);
+      const currentValueUsd = +(itemGrams * currentUsdPerGram).toFixed(2);
+      const profitLossUsd = +(currentValueUsd - itemBuyPriceUsd).toFixed(2);
 
       return {
         ...item,
         live_price_per_gram_usd: currentUsdPerGram,
-        live_estimated_value_usd: currentValue,
-        live_profit_loss: profitLoss,
+        live_estimated_value_usd: currentValueUsd,
+        live_profit_loss_usd: profitLossUsd,
+        buy_price_converted: +(itemBuyPriceUsd * exchangeRate).toFixed(2),
+        live_price_per_gram_converted: +(currentUsdPerGram * exchangeRate).toFixed(2),
+        live_estimated_value_converted: +(currentValueUsd * exchangeRate).toFixed(2),
+        live_profit_loss_converted: +(profitLossUsd * exchangeRate).toFixed(2),
       };
     });
-  }, [items, goldData]);
+  }, [items, goldData, exchangeRate]);
+
+  const currencyOptions = useMemo(() => {
+    return Object.keys(rates).sort();
+  }, [rates]);
 
   return (
     <div className="dashboard-page">
       <div className="topbar">
         <div>
-          <div style={{ display: "flex", gap: "8px" }}>
+          <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
             <button onClick={() => changeLang("en")}>EN</button>
             <button onClick={() => changeLang("zh")}>中文</button>
           </div>
+
           <h1>{t("title")}</h1>
           <p>
             {t("welcome")}
@@ -163,9 +209,28 @@ export default function Dashboard({ user, onLogout }) {
           </p>
         </div>
 
-        <button className="secondary-btn" onClick={onLogout}>
-          {t("logout")}
-        </button>
+        <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+          <div>
+            <label style={{ display: "block", fontSize: "14px", marginBottom: "4px" }}>
+              Currency
+            </label>
+            <select
+              value={selectedCurrency}
+              onChange={(e) => setSelectedCurrency(e.target.value)}
+              disabled={loadingRates}
+            >
+              {currencyOptions.map((code) => (
+                <option key={code} value={code}>
+                  {code}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <button className="secondary-btn" onClick={onLogout}>
+            {t("logout")}
+          </button>
+        </div>
       </div>
 
       <div className="grid">
@@ -177,16 +242,24 @@ export default function Dashboard({ user, onLogout }) {
           ) : goldData ? (
             <>
               <p>
-                <strong>XAU/USD:</strong> ${Number(goldData.xauUsd).toFixed(2)}
+                <strong>XAU/USD:</strong> {formatMoney(Number(goldData.xauUsd), "USD")}
               </p>
+
               <p>
-                <strong>{t("usdPerGram")}</strong> $
-                {Number(goldData.usdPerGram).toFixed(2)}
+                <strong>{t("usdPerGram")} (USD):</strong>{" "}
+                {formatMoney(Number(goldData.usdPerGram), "USD")}
               </p>
+
+              <p>
+                <strong>{t("currentPrice")} ({selectedCurrency}/g):</strong>{" "}
+                {formatMoney(Number(goldData.usdPerGram || 0) * exchangeRate)}
+              </p>
+
               <p>
                 <strong>{t("updated")}:</strong>{" "}
                 {new Date(goldData.updatedAt).toLocaleString()}
               </p>
+
               <p className="small-text">{t("autoRefresh")}</p>
             </>
           ) : (
@@ -222,7 +295,7 @@ export default function Dashboard({ user, onLogout }) {
             </div>
 
             <div className="field">
-              <label>{t("buyPrice")}</label>
+              <label>{t("buyPrice")} (USD)</label>
               <input
                 type="number"
                 step="0.01"
@@ -252,39 +325,43 @@ export default function Dashboard({ user, onLogout }) {
             {enrichedItems.map((item) => (
               <div key={item.id} className="item-card">
                 <img
-                  src={`${backendBase}${item.image_path}`}
+                  src={item.imagePath}
                   alt="Gold item"
                   className="item-image"
                 />
+
                 <div className="item-info">
                   <p>
-                    <strong>{t("grams")}:</strong>{" "}
-                    {Number(item.grams).toFixed(2)}
+                    <strong>{t("grams")}:</strong> {Number(item.grams).toFixed(2)}
                   </p>
 
                   <p>
-                    <strong>{t("buyPriceLabel")}:</strong> $
-                    {Number(item.buy_price_total || 0).toFixed(2)}
+                    <strong>{t("buyPriceLabel")}:</strong>{" "}
+                    {formatMoney(item.buy_price_converted)}
+                  </p>
+
+                  <p className="small-text">
+                    USD base: {formatMoney(item.buyPriceTotal || 0, "USD")}
                   </p>
 
                   <p>
-                    <strong>{t("currentPrice")}:</strong> $
-                    {Number(item.live_price_per_gram_usd || 0).toFixed(2)}
+                    <strong>{t("currentPrice")}:</strong>{" "}
+                    {formatMoney(item.live_price_per_gram_converted)}
                   </p>
 
                   <p>
-                    <strong>{t("currentValue")}:</strong> $
-                    {Number(item.live_estimated_value_usd || 0).toFixed(2)}
+                    <strong>{t("currentValue")}:</strong>{" "}
+                    {formatMoney(item.live_estimated_value_converted)}
                   </p>
 
                   <p>
                     <strong>{t("profitLoss")}:</strong>{" "}
                     <span
                       className={
-                        Number(item.live_profit_loss) >= 0 ? "profit" : "loss"
+                        Number(item.live_profit_loss_converted) >= 0 ? "profit" : "loss"
                       }
                     >
-                      ${Number(item.live_profit_loss || 0).toFixed(2)}
+                      {formatMoney(item.live_profit_loss_converted)}
                     </span>
                   </p>
 
@@ -296,7 +373,7 @@ export default function Dashboard({ user, onLogout }) {
                   </button>
 
                   <p className="small-text">
-                    {t("added")}: {new Date(item.created_at).toLocaleString()}
+                    {t("added")}: {new Date(item.createdAt).toLocaleString()}
                   </p>
                 </div>
               </div>
