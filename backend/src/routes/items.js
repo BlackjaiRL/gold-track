@@ -4,7 +4,7 @@ const axios = require("axios");
 const { requireAuth } = require("../middleware/auth");
 const { getPool } = require("../db/mysql");
 const FormData = require("form-data");
-
+let cloudreveCookie = null;
 const router = express.Router();
 
 const CLOUDREVE_BASE = process.env.CLOUDREVE_BASE_URL;
@@ -32,6 +32,22 @@ const upload = multer({
 const GOLD_URL =
   "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD";
 
+async function loginToCloudreve() {
+  const res = await axios.post(
+    `${CLOUDREVE_BASE}/api/v4/user/session`,
+    {
+      username: process.env.CLOUDREVE_USERNAME,
+      password: process.env.CLOUDREVE_PASSWORD,
+    },
+    {
+      withCredentials: true,
+    }
+  );
+
+  const cookies = res.headers["set-cookie"];
+  cloudreveCookie = cookies?.join("; ");
+}
+
 function extractPrice(data) {
   const item = Array.isArray(data) ? data[0] : data;
   return Number(
@@ -45,12 +61,16 @@ function extractPrice(data) {
 
 function getCloudreveHeaders(extra = {}) {
   return {
-    Authorization: `Bearer ${CLOUDREVE_TOKEN}`,
-    ...extra,
+    headers: {
+      Cookie: cloudreveCookie,
+    }
   };
 }
 
 async function uploadToCloudreve(file) {
+  if (!cloudreveCookie) {
+    await loginToCloudreve();
+  }
   const sessionRes = await axios.put(
     `${CLOUDREVE_BASE}/api/v4/file/upload`,
     {
