@@ -1,25 +1,19 @@
 const express = require("express");
 const multer = require("multer");
 const axios = require("axios");
-const { v2: cloudinary } = require("cloudinary");
 const { requireAuth } = require("../middleware/auth");
 const { getPool } = require("../db/mysql");
+const FormData = require("form-data");
 
 const router = express.Router();
 
-if (
-  !process.env.CLOUDINARY_CLOUD_NAME ||
-  !process.env.CLOUDINARY_API_KEY ||
-  !process.env.CLOUDINARY_API_SECRET
-) {
-  throw new Error("Missing Cloudinary environment variables");
-}
+const CLOUDREVE_BASE = process.env.CLOUDREVE_BASE_URL;
+const CLOUDREVE_TOKEN = process.env.CLOUDREVE_TOKEN;
+const CLOUDREVE_PARENT = "cloudreve://my/website-images";
 
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-});
+if (!CLOUDREVE_BASE || !CLOUDREVE_TOKEN) {
+  throw new Error("Missing Cloudreve environment variables");
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -49,22 +43,77 @@ function extractPrice(data) {
   );
 }
 
-function uploadBufferToCloudinary(buffer, options = {}) {
-  return new Promise((resolve, reject) => {
-    const uploadStream = cloudinary.uploader.upload_stream(
-      {
-        folder: "gold-track",
-        resource_type: "image",
-        ...options,
-      },
-      (error, result) => {
-        if (error) return reject(error);
-        resolve(result);
-      }
-    );
+function getCloudreveHeaders(extra = {}) {
+  return {
+    Authorization: `Bearer ${CLOUDREVE_TOKEN}`,
+    ...extra,
+  };
+}
 
-    uploadStream.end(buffer);
-  });
+async function uploadToCloudreve(file) {
+  const sessionRes = await axios.put(
+    `${CLOUDREVE_BASE}/api/v4/file/upload`,
+    {
+      uri: CLOUDREVE_PARENT,
+      name: file.originalname,
+      size: file.size,
+      mime_type: file.mimetype,
+    },
+    {
+      headers: getCloudreveHeaders(),
+      timeout: 30000,
+    }
+  );
+
+  if (sessionRes.data?.code !== 0) {
+    throw new Error(sessionRes.data?.msg || "Upload session failed");
+  }
+
+  const sessionId =
+    sessionRes.data?.data?.session_id ||
+    sessionRes.data?.data?.sessionId ||
+    sessionRes.data?.data?.id;
+
+  if (!sessionId) {
+    throw new Error("Cloudreve upload session ID missing");
+  }
+
+  const form = new FormData();
+  form.append("file", file.buffer, file.originalname);
+
+  const uploadRes = await axios.post(
+    `${CLOUDREVE_BASE}/api/v4/file/upload/${sessionId}`,
+    form,
+    {
+      headers: getCloudreveHeaders(form.getHeaders()),
+      timeout: 30000,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+    }
+  );
+
+  if (uploadRes.data?.code !== 0) {
+    throw new Error(uploadRes.data?.msg || "File upload failed");
+  }
+
+  const finishRes = await axios.post(
+    `${CLOUDREVE_BASE}/api/v4/file/upload/${sessionId}/finish`,
+    {},
+    {
+      headers: getCloudreveHeaders(),
+      timeout: 30000,
+    }
+  );
+
+  if (finishRes.data?.code !== 0) {
+    throw new Error(finishRes.data?.msg || "Finish upload failed");
+  }
+
+  return finishRes.data?.data;
+}
+
+function buildImageUrl(fileUri) {
+  return `${CLOUDREVE_BASE}/api/v4/file/download?uri=${encodeURIComponent(fileUri)}`;
 }
 
 router.post("/", requireAuth, (req, res) => {
@@ -95,9 +144,14 @@ router.post("/", requireAuth, (req, res) => {
         return res.status(400).json({ error: "Valid buy price is required" });
       }
 
-      const uploaded = await uploadBufferToCloudinary(req.file.buffer, {
-        folder: `gold-track/user-${req.user.id}`,
-      });
+      const uploaded = await uploadToCloudreve(req.file);
+
+      const fileUri = uploaded?.uri || uploaded?.path;
+      if (!fileUri) {
+        throw new Error("Cloudreve did not return a file URI/path");
+      }
+
+      const imageUrl = buildImageUrl(fileUri);
 
       const priceResponse = await axios.get(GOLD_URL, { timeout: 10000 });
       const xauUsd = extractPrice(priceResponse.data);
@@ -118,8 +172,8 @@ router.post("/", requireAuth, (req, res) => {
         VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [
           req.user.id,
-          uploaded.secure_url,
-          uploaded.public_id,
+          imageUrl,
+          fileUri,
           grams,
           buyPriceTotal,
           usdPerGram,
@@ -129,8 +183,8 @@ router.post("/", requireAuth, (req, res) => {
 
       res.json({
         id: result.insertId,
-        imagePath: uploaded.secure_url,
-        imagePublicId: uploaded.public_id,
+        imagePath: imageUrl,
+        imagePublicId: fileUri,
         grams,
         buyPriceTotal,
         pricePerGramUsd: usdPerGram,
@@ -138,7 +192,7 @@ router.post("/", requireAuth, (req, res) => {
         profitLoss,
       });
     } catch (err) {
-      console.error("POST /api/items error:", err);
+      console.error("POST /api/items error:", err.response?.data || err.message || err);
       res.status(500).json({
         error: err.message || "Failed to save item",
       });
@@ -212,14 +266,22 @@ router.delete("/:id", requireAuth, async (req, res) => {
 
     if (item.image_public_id) {
       try {
-        await cloudinary.uploader.destroy(item.image_public_id, {
-          resource_type: "image",
+        const deleteRes = await axios.delete(`${CLOUDREVE_BASE}/api/v4/file`, {
+          headers: getCloudreveHeaders(),
+          data: {
+            items: [item.image_public_id],
+          },
+          timeout: 30000,
         });
+
+        if (deleteRes.data?.code !== 0) {
+          console.error("Cloudreve delete failed:", deleteRes.data);
+        }
       } catch (cloudErr) {
         console.error(
-          "Cloudinary delete failed:",
+          "Server delete failed:",
           item.image_public_id,
-          cloudErr.message
+          cloudErr.response?.data || cloudErr.message
         );
       }
     }

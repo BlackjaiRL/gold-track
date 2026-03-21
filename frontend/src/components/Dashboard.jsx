@@ -48,7 +48,12 @@ export default function Dashboard({ user, onLogout }) {
     try {
       setLoadingRates(true);
       const response = await fetch("https://open.er-api.com/v6/latest/USD");
-      const data = await response.json();
+      let data = {};
+      try {
+        data = await response.json();
+      } catch {
+        data = {};
+      }
 
       if (!response.ok || data.result === "error") {
         throw new Error(data.error || "Failed to load exchange rates");
@@ -129,7 +134,12 @@ export default function Dashboard({ user, onLogout }) {
         body: formData,
       });
 
-      const data = await response.json();
+      let data = {};
+      try {
+        data = await response.json();
+      } catch {
+        data = {};
+      }
 
       if (!response.ok) {
         throw new Error(data.error || "Upload failed");
@@ -351,6 +361,9 @@ export default function Dashboard({ user, onLogout }) {
                   src={item.imagePath}
                   alt="Gold item"
                   className="item-image"
+                  onError={(e) => {
+                    e.currentTarget.style.display = "none";
+                  }}
                 />
 
                 <div className="item-info">

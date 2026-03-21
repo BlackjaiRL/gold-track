@@ -28,9 +28,7 @@ export function clearUser() {
 export async function apiFetch(path, options = {}) {
   const token = getToken();
 
-  const headers = {
-    ...(options.headers || {})
-  };
+  const headers = { ...(options.headers || {}) };
 
   if (!(options.body instanceof FormData)) {
     headers["Content-Type"] = "application/json";
@@ -42,7 +40,7 @@ export async function apiFetch(path, options = {}) {
 
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
-    headers
+    headers,
   });
 
   const data = await response.json().catch(() => ({}));
