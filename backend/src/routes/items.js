@@ -11,10 +11,10 @@ let cloudreveCookie = null;
 const CLOUDREVE_BASE = process.env.CLOUDREVE_BASE_URL;
 const CLOUDREVE_PARENT =
   process.env.CLOUDREVE_PARENT_URI || "cloudreve://my/website-images";
-const CLOUDREVE_USERNAME = process.env.CLOUDREVE_USERNAME;
+const CLOUDREVE_EMAIL = process.env.CLOUDREVE_EMAIL;
 const CLOUDREVE_PASSWORD = process.env.CLOUDREVE_PASSWORD;
 
-if (!CLOUDREVE_BASE || !CLOUDREVE_USERNAME || !CLOUDREVE_PASSWORD) {
+if (!CLOUDREVE_BASE || !CLOUDREVE_EMAIL || !CLOUDREVE_PASSWORD) {
   throw new Error("Missing Cloudreve environment variables");
 }
 
@@ -36,12 +36,23 @@ const GOLD_URL =
   "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD";
 
 async function loginToCloudreve() {
+  const payload = {
+    email: CLOUDREVE_EMAIL,
+    password: CLOUDREVE_PASSWORD,
+  };
+
+  // Only include these if your Cloudreve asks for captcha
+  if (process.env.CLOUDREVE_CAPTCHA) {
+    payload.captcha = process.env.CLOUDREVE_CAPTCHA;
+  }
+
+  if (process.env.CLOUDREVE_TICKET) {
+    payload.ticket = process.env.CLOUDREVE_TICKET;
+  }
+
   const res = await axios.post(
-    `${CLOUDREVE_BASE}/user/session`,
-    {
-      username: CLOUDREVE_USERNAME,
-      password: CLOUDREVE_PASSWORD,
-    },
+    `${CLOUDREVE_BASE}/session/token`,
+    payload,
     {
       timeout: 30000,
       withCredentials: true,
