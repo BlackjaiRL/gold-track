@@ -37,7 +37,7 @@ const GOLD_URL =
 
 async function loginToCloudreve() {
   const res = await axios.post(
-    `${CLOUDREVE_BASE}/api/v4/user/session`,
+    `${CLOUDREVE_BASE}/user/session`,
     {
       username: CLOUDREVE_USERNAME,
       password: CLOUDREVE_PASSWORD,
@@ -80,7 +80,7 @@ async function uploadToCloudreve(file) {
   }
 
   const sessionRes = await axios.put(
-    `${CLOUDREVE_BASE}/api/v4/file/upload`,
+    `${CLOUDREVE_BASE}/file/upload`,
     {
       uri: CLOUDREVE_PARENT,
       name: file.originalname,
@@ -110,7 +110,7 @@ async function uploadToCloudreve(file) {
   form.append("file", file.buffer, file.originalname);
 
   const uploadRes = await axios.post(
-    `${CLOUDREVE_BASE}/api/v4/file/upload/${sessionId}`,
+    `${CLOUDREVE_BASE}/file/upload/${sessionId}`,
     form,
     {
       headers: getCloudreveHeaders(form.getHeaders()),
@@ -125,7 +125,7 @@ async function uploadToCloudreve(file) {
   }
 
   const finishRes = await axios.post(
-    `${CLOUDREVE_BASE}/api/v4/file/upload/${sessionId}/finish`,
+    `${CLOUDREVE_BASE}/file/upload/${sessionId}/finish`,
     {},
     {
       headers: getCloudreveHeaders(),
@@ -141,7 +141,7 @@ async function uploadToCloudreve(file) {
 }
 
 function buildImageUrl(fileUri) {
-  return `${CLOUDREVE_BASE}/api/v4/file/download?uri=${encodeURIComponent(fileUri)}`;
+  return `${CLOUDREVE_BASE}/file/download?uri=${encodeURIComponent(fileUri)}`;
 }
 
 router.post("/", requireAuth, (req, res) => {
@@ -299,7 +299,7 @@ router.delete("/:id", requireAuth, async (req, res) => {
           await loginToCloudreve();
         }
 
-        const deleteRes = await axios.delete(`${CLOUDREVE_BASE}/api/v4/file`, {
+        const deleteRes = await axios.delete(`${CLOUDREVE_BASE}/file`, {
           headers: getCloudreveHeaders(),
           data: {
             items: [item.image_public_id],
