@@ -1,78 +1,36 @@
+// backend/src/routes/items.js
 const express = require("express");
 const multer = require("multer");
 const axios = require("axios");
 const { requireAuth } = require("../middleware/auth");
 const { getPool } = require("../db/mysql");
-const FormData = require("form-data");
+
+const {
+  ensureAccessToken,
+  createUploadSession,
+  uploadChunk,
+  createDirectLinks,
+  deleteFiles,
+  createFile,
+  CloudreveApiError
+} = require("../services/cloudreve");
 
 const router = express.Router();
-let cloudreveCookie = null;
 
-const CLOUDREVE_BASE = process.env.CLOUDREVE_BASE_URL;
-const CLOUDREVE_PARENT =
-  process.env.CLOUDREVE_PARENT_URI || "cloudreve://my/website-images";
-const CLOUDREVE_EMAIL = process.env.CLOUDREVE_EMAIL;
-const CLOUDREVE_PASSWORD = process.env.CLOUDREVE_PASSWORD;
-
-if (!CLOUDREVE_BASE || !CLOUDREVE_EMAIL || !CLOUDREVE_PASSWORD) {
-  throw new Error("Missing Cloudreve environment variables");
-}
+const CLOUDREVE_PARENT_URI = process.env.CLOUDREVE_PARENT_URI || "cloudreve://my/website-images";
+const CLOUDREVE_POLICY_ID = process.env.CLOUDREVE_POLICY_ID || null;
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024,
-  },
+  limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    if (file.mimetype && file.mimetype.startsWith("image/")) {
-      cb(null, true);
-    } else {
-      cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "image"));
-    }
-  },
+    if (file.mimetype && file.mimetype.startsWith("image/")) cb(null, true);
+    else cb(new multer.MulterError("LIMIT_UNEXPECTED_FILE", "image"));
+  }
 });
 
 const GOLD_URL =
   "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD";
-
-async function loginToCloudreve() {
-  const payload = {
-    email: CLOUDREVE_EMAIL,
-    password: CLOUDREVE_PASSWORD,
-  };
-
-  // Only include these if your Cloudreve asks for captcha
-  if (process.env.CLOUDREVE_CAPTCHA) {
-    payload.captcha = process.env.CLOUDREVE_CAPTCHA;
-  }
-
-  if (process.env.CLOUDREVE_TICKET) {
-    payload.ticket = process.env.CLOUDREVE_TICKET;
-  }
-
-  const res = await axios.post(
-    `${CLOUDREVE_BASE}/session/token`,
-    payload,
-    {
-      timeout: 30000,
-      withCredentials: true,
-    }
-  );
-
-  const cookies = res.headers["set-cookie"];
-  cloudreveCookie = cookies?.join("; ");
-
-  if (!cloudreveCookie) {
-    throw new Error("Cloudreve login did not return session cookie");
-  }
-}
-
-function getCloudreveHeaders(extra = {}) {
-  return {
-    Cookie: cloudreveCookie,
-    ...extra,
-  };
-}
 
 function extractPrice(data) {
   const item = Array.isArray(data) ? data[0] : data;
@@ -85,74 +43,17 @@ function extractPrice(data) {
   );
 }
 
-async function uploadToCloudreve(file) {
-  if (!cloudreveCookie) {
-    await loginToCloudreve();
-  }
-
-  const sessionRes = await axios.put(
-    `${CLOUDREVE_BASE}/file/upload`,
-    {
-      uri: CLOUDREVE_PARENT,
-      name: file.originalname,
-      size: file.size,
-      mime_type: file.mimetype,
-    },
-    {
-      headers: getCloudreveHeaders(),
-      timeout: 30000,
-    }
-  );
-
-  if (sessionRes.data?.code !== 0) {
-    throw new Error(sessionRes.data?.msg || "Upload session failed");
-  }
-
-  const sessionId =
-    sessionRes.data?.data?.session_id ||
-    sessionRes.data?.data?.sessionId ||
-    sessionRes.data?.data?.id;
-
-  if (!sessionId) {
-    throw new Error("Cloudreve upload session ID missing");
-  }
-
-  const form = new FormData();
-  form.append("file", file.buffer, file.originalname);
-
-  const uploadRes = await axios.post(
-    `${CLOUDREVE_BASE}/file/upload/${sessionId}`,
-    form,
-    {
-      headers: getCloudreveHeaders(form.getHeaders()),
-      timeout: 30000,
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-    }
-  );
-
-  if (uploadRes.data?.code !== 0) {
-    throw new Error(uploadRes.data?.msg || "File upload failed");
-  }
-
-  const finishRes = await axios.post(
-    `${CLOUDREVE_BASE}/file/upload/${sessionId}/finish`,
-    {},
-    {
-      headers: getCloudreveHeaders(),
-      timeout: 30000,
-    }
-  );
-
-  if (finishRes.data?.code !== 0) {
-    throw new Error(finishRes.data?.msg || "Finish upload failed");
-  }
-
-  return finishRes.data?.data;
+function safeFilename(originalName) {
+  const ext = (originalName || "").includes(".")
+    ? "." + originalName.split(".").pop().toLowerCase()
+    : "";
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}${ext}`;
 }
 
-function buildImageUrl(fileUri) {
-  return `${CLOUDREVE_BASE}/file/download?uri=${encodeURIComponent(fileUri)}`;
+function joinUri(parent, filename) {
+  const p = String(parent).replace(/\/+$/, "");
+  // Keep this simple; Cloudreve URIs in docs show URL-encoded path segments.
+  return `${p}/${encodeURIComponent(filename)}`;
 }
 
 router.post("/", requireAuth, (req, res) => {
@@ -171,27 +72,63 @@ router.post("/", requireAuth, (req, res) => {
       const grams = Number(req.body.grams);
       const buyPriceTotal = Number(req.body.buyPriceTotal);
 
-      if (!req.file) {
-        return res.status(400).json({ error: "Image is required" });
-      }
-
+      if (!req.file) return res.status(400).json({ error: "Image is required" });
       if (!Number.isFinite(grams) || grams <= 0) {
         return res.status(400).json({ error: "Valid grams value is required" });
       }
-
       if (!Number.isFinite(buyPriceTotal) || buyPriceTotal < 0) {
         return res.status(400).json({ error: "Valid buy price is required" });
       }
 
-      const uploaded = await uploadToCloudreve(req.file);
-
-      const fileUri = uploaded?.uri || uploaded?.path;
-      if (!fileUri) {
-        console.log("Cloudreve finish data:", uploaded);
-        throw new Error("Cloudreve did not return a file URI/path");
+      // Ensure access token (refreshes automatically)
+      let accessToken;
+      try {
+        accessToken = await ensureAccessToken(req.user.id);
+      } catch (e) {
+        // signal frontend to run Cloudreve setup
+        return res.status(428).json({ error: "Storage setup required", cloudreveSetupRequired: true });
       }
 
-      const imageUrl = buildImageUrl(fileUri);
+      // Ensure parent folder exists (best-effort)
+      // Payload for folder creation is not fully shown; we rely on "Create a new folder" example being supported.
+      try {
+        await createFile({ token: accessToken, type: "folder", uri: CLOUDREVE_PARENT_URI, err_on_conflict: false });
+      } catch (_) {
+        // ignore: folder might already exist or server may reject the inferred payload
+      }
+
+      const filename = safeFilename(req.file.originalname);
+      const fileUri = joinUri(CLOUDREVE_PARENT_URI, filename);
+
+      const session = await createUploadSession({
+        token: accessToken,
+        uri: fileUri,
+        size: req.file.size,
+        policy_id: CLOUDREVE_POLICY_ID,
+        last_modified: Date.now(),
+        mime_type: req.file.mimetype
+      });
+
+      const sessionId = session.session_id;
+      const chunkSize = Number(session.chunk_size || req.file.size);
+      if (!sessionId) throw new Error("Upload session_id missing");
+
+      // Upload all chunks sequentially
+      if (req.file.buffer.length <= chunkSize) {
+        await uploadChunk({ token: accessToken, sessionId, index: 0, buffer: req.file.buffer });
+      } else {
+        let idx = 0;
+        for (let off = 0; off < req.file.buffer.length; off += chunkSize) {
+          const slice = req.file.buffer.subarray(off, off + chunkSize);
+          await uploadChunk({ token: accessToken, sessionId, index: idx, buffer: slice });
+          idx += 1;
+        }
+      }
+
+      // For local/relay policies, no finish call required. (See Cloudreve docs.)
+      // Create direct link for public image display.
+      const links = await createDirectLinks({ token: accessToken, uris: [fileUri] });
+      const imageUrl = links?.[0]?.link || null;
 
       const priceResponse = await axios.get(GOLD_URL, { timeout: 10000 });
       const xauUsd = extractPrice(priceResponse.data);
@@ -205,37 +142,34 @@ router.post("/", requireAuth, (req, res) => {
       const profitLoss = +(estimatedValueUsd - buyPriceTotal).toFixed(2);
 
       const pool = getPool();
-
       const [result] = await pool.query(
         `INSERT INTO gold_items
-        (user_id, image_path, image_public_id, grams, buy_price_total, price_per_gram_usd, estimated_value_usd)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         (user_id, image_path, image_public_id, grams, buy_price_total, price_per_gram_usd, estimated_value_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [
           req.user.id,
-          imageUrl,
+          imageUrl || fileUri,
           fileUri,
           grams,
           buyPriceTotal,
           usdPerGram,
-          estimatedValueUsd,
+          estimatedValueUsd
         ]
       );
 
       res.json({
         id: result.insertId,
-        imagePath: imageUrl,
+        imagePath: imageUrl || fileUri,
         imagePublicId: fileUri,
         grams,
         buyPriceTotal,
         pricePerGramUsd: usdPerGram,
         estimatedValueUsd,
-        profitLoss,
+        profitLoss
       });
     } catch (err) {
       console.error("POST /api/items error:", err.response?.data || err.message || err);
-      res.status(500).json({
-        error: err.message || "Failed to save item",
-      });
+      res.status(500).json({ error: err.message || "Failed to save item" });
     }
   });
 });
@@ -243,17 +177,9 @@ router.post("/", requireAuth, (req, res) => {
 router.get("/", requireAuth, async (req, res) => {
   try {
     const pool = getPool();
-
     const [rows] = await pool.query(
-      `SELECT
-         id,
-         image_path,
-         image_public_id,
-         grams,
-         buy_price_total,
-         price_per_gram_usd,
-         estimated_value_usd,
-         created_at
+      `SELECT id, image_path, image_public_id, grams, buy_price_total,
+              price_per_gram_usd, estimated_value_usd, created_at
        FROM gold_items
        WHERE user_id = ?
        ORDER BY created_at DESC`,
@@ -271,7 +197,7 @@ router.get("/", requireAuth, async (req, res) => {
       profitLoss: +(
         Number(item.estimated_value_usd) - Number(item.buy_price_total)
       ).toFixed(2),
-      createdAt: item.created_at,
+      createdAt: item.created_at
     }));
 
     res.json(items);
@@ -284,13 +210,11 @@ router.get("/", requireAuth, async (req, res) => {
 router.delete("/:id", requireAuth, async (req, res) => {
   try {
     const itemId = Number(req.params.id);
-
     if (!Number.isFinite(itemId) || itemId <= 0) {
       return res.status(400).json({ error: "Invalid item id" });
     }
 
     const pool = getPool();
-
     const [rows] = await pool.query(
       `SELECT id, image_public_id
        FROM gold_items
@@ -298,41 +222,22 @@ router.delete("/:id", requireAuth, async (req, res) => {
       [itemId, req.user.id]
     );
 
-    if (!rows.length) {
-      return res.status(404).json({ error: "Item not found" });
-    }
+    if (!rows.length) return res.status(404).json({ error: "Item not found" });
 
-    const item = rows[0];
+    const fileUri = rows[0].image_public_id;
 
-    if (item.image_public_id) {
+    if (fileUri) {
       try {
-        if (!cloudreveCookie) {
-          await loginToCloudreve();
-        }
-
-        const deleteRes = await axios.delete(`${CLOUDREVE_BASE}/file`, {
-          headers: getCloudreveHeaders(),
-          data: {
-            items: [item.image_public_id],
-          },
-          timeout: 30000,
-        });
-
-        if (deleteRes.data?.code !== 0) {
-          console.error("Cloudreve delete failed:", deleteRes.data);
-        }
-      } catch (cloudErr) {
-        console.error(
-          "Server delete failed:",
-          item.image_public_id,
-          cloudErr.response?.data || cloudErr.message
-        );
+        const accessToken = await ensureAccessToken(req.user.id);
+        await deleteFiles({ token: accessToken, uris: [fileUri], unlink: false, skip_soft_delete: true });
+      } catch (e) {
+        console.error("Cloudreve delete failed:", e.message || e);
       }
     }
 
     await pool.query("DELETE FROM gold_items WHERE id = ? AND user_id = ?", [
       itemId,
-      req.user.id,
+      req.user.id
     ]);
 
     res.json({ success: true });
