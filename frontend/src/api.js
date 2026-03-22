@@ -35,7 +35,7 @@ export async function apiFetch(path, options = {}) {
   }
 
   if (token) {
-    headers.Authorization = `${token}`;
+    headers.Authorization = `Bearer ${token}`;
   }
 
   const response = await fetch(`${API_BASE}${path}`, {

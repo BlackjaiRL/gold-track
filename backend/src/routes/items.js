@@ -4,14 +4,17 @@ const axios = require("axios");
 const { requireAuth } = require("../middleware/auth");
 const { getPool } = require("../db/mysql");
 const FormData = require("form-data");
-let cloudreveCookie = null;
+
 const router = express.Router();
+let cloudreveCookie = null;
 
 const CLOUDREVE_BASE = process.env.CLOUDREVE_BASE_URL;
-const CLOUDREVE_TOKEN = process.env.CLOUDREVE_TOKEN;
-const CLOUDREVE_PARENT = "cloudreve://my/website-images";
+const CLOUDREVE_PARENT =
+  process.env.CLOUDREVE_PARENT_URI || "cloudreve://my/website-images";
+const CLOUDREVE_USERNAME = process.env.CLOUDREVE_USERNAME;
+const CLOUDREVE_PASSWORD = process.env.CLOUDREVE_PASSWORD;
 
-if (!CLOUDREVE_BASE || !CLOUDREVE_TOKEN) {
+if (!CLOUDREVE_BASE || !CLOUDREVE_USERNAME || !CLOUDREVE_PASSWORD) {
   throw new Error("Missing Cloudreve environment variables");
 }
 
@@ -36,16 +39,28 @@ async function loginToCloudreve() {
   const res = await axios.post(
     `${CLOUDREVE_BASE}/api/v4/user/session`,
     {
-      username: process.env.CLOUDREVE_USERNAME,
-      password: process.env.CLOUDREVE_PASSWORD,
+      username: CLOUDREVE_USERNAME,
+      password: CLOUDREVE_PASSWORD,
     },
     {
+      timeout: 30000,
       withCredentials: true,
     }
   );
 
   const cookies = res.headers["set-cookie"];
   cloudreveCookie = cookies?.join("; ");
+
+  if (!cloudreveCookie) {
+    throw new Error("Cloudreve login did not return session cookie");
+  }
+}
+
+function getCloudreveHeaders(extra = {}) {
+  return {
+    Cookie: cloudreveCookie,
+    ...extra,
+  };
 }
 
 function extractPrice(data) {
@@ -59,18 +74,11 @@ function extractPrice(data) {
   );
 }
 
-function getCloudreveHeaders(extra = {}) {
-  return {
-    headers: {
-      Cookie: cloudreveCookie,
-    }
-  };
-}
-
 async function uploadToCloudreve(file) {
   if (!cloudreveCookie) {
     await loginToCloudreve();
   }
+
   const sessionRes = await axios.put(
     `${CLOUDREVE_BASE}/api/v4/file/upload`,
     {
@@ -168,6 +176,7 @@ router.post("/", requireAuth, (req, res) => {
 
       const fileUri = uploaded?.uri || uploaded?.path;
       if (!fileUri) {
+        console.log("Cloudreve finish data:", uploaded);
         throw new Error("Cloudreve did not return a file URI/path");
       }
 
@@ -286,6 +295,10 @@ router.delete("/:id", requireAuth, async (req, res) => {
 
     if (item.image_public_id) {
       try {
+        if (!cloudreveCookie) {
+          await loginToCloudreve();
+        }
+
         const deleteRes = await axios.delete(`${CLOUDREVE_BASE}/api/v4/file`, {
           headers: getCloudreveHeaders(),
           data: {
