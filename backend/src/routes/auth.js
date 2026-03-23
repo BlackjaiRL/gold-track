@@ -11,7 +11,7 @@ const {
   getCaptcha,
   ensureCloudreveAccount,
   ensureAccessToken,
-  CloudreveApiError
+  CloudreveApiError,
 } = require("../services/cloudreve");
 
 const router = express.Router();
@@ -21,7 +21,7 @@ function signToken(user) {
   return jwt.sign(
     { id: user.id, email: user.email, name: user.name || null },
     process.env.JWT_SECRET,
-    { expiresIn: "7d" }
+    { expiresIn: "7d" },
   );
 }
 
@@ -63,30 +63,103 @@ router.get("/cloudreve/captcha", async (_req, res) => {
 router.post("/cloudreve/ensure", requireAuth, async (req, res) => {
   try {
     const { captcha, ticket } = req.body || {};
-    const result = await ensureCloudreveAccount(req.user.id, { captcha, ticket });
+    const pool = getPool();
 
-    if (result.captchaRequired) {
-      return res.status(428).json(result);
+    const [rows] = await pool.query(
+      `SELECT email, name,
+              cloudreve_email, cloudreve_password_enc, cloudreve_user_id,
+              cloudreve_access_token, cloudreve_access_expires_at,
+              cloudreve_refresh_token, cloudreve_refresh_expires_at
+       FROM users
+       WHERE id = ?`,
+      [req.user.id],
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "User not found" });
     }
-    if (!result.linked && result.requiresActivation) {
-      // Activation required: still a setup-required state.
+
+    const u = rows[0];
+    const cloudreveEmail = u.cloudreve_email || u.email;
+
+    const ensureResult = await ensureCloudreveAccount({
+      appEmail: cloudreveEmail,
+      appName: u.name || "",
+      existingCloudrevePasswordEnc: u.cloudreve_password_enc,
+      captcha,
+      ticket,
+    });
+
+    if (ensureResult.captchaRequired) {
+      return res.status(428).json(ensureResult);
+    }
+
+    // save newly created Cloudreve account credentials
+    if (ensureResult.created && ensureResult.cloudrevePasswordEnc) {
+      await pool.query(
+        `UPDATE users
+         SET cloudreve_email = ?,
+             cloudreve_password_enc = ?,
+             cloudreve_user_id = COALESCE(cloudreve_user_id, ?)
+         WHERE id = ?`,
+        [
+          ensureResult.cloudreveEmail,
+          ensureResult.cloudrevePasswordEnc,
+          ensureResult.cloudreveUserId || null,
+          req.user.id,
+        ],
+      );
+    }
+
+    if (ensureResult.requiresActivation) {
       return res.status(428).json({
         linked: false,
         requiresActivation: true,
-        reason: result.reason,
-        cfg: result.cfg
+        reason: ensureResult.reason || "Activation required",
+        cfg: ensureResult.cfg || null,
       });
     }
 
-    // Also ensure we have a working access token right now
-    await ensureAccessToken(req.user.id, { captcha, ticket });
+    const latestPasswordEnc =
+      ensureResult.cloudrevePasswordEnc || u.cloudreve_password_enc;
+
+    const tokens = await ensureAccessToken({
+      cloudreveEmail,
+      cloudrevePasswordEnc: latestPasswordEnc,
+      accessToken: u.cloudreve_access_token,
+      accessExpiresAt: u.cloudreve_access_expires_at,
+      refreshToken: u.cloudreve_refresh_token,
+      refreshExpiresAt: u.cloudreve_refresh_expires_at,
+      captcha,
+      ticket,
+    });
+
+    await pool.query(
+      `UPDATE users
+       SET cloudreve_access_token = ?,
+           cloudreve_access_expires_at = ?,
+           cloudreve_refresh_token = ?,
+           cloudreve_refresh_expires_at = ?,
+           cloudreve_user_id = COALESCE(cloudreve_user_id, ?)
+       WHERE id = ?`,
+      [
+        tokens.accessToken,
+        tokens.accessExpiresAt,
+        tokens.refreshToken,
+        tokens.refreshExpiresAt,
+        tokens.cloudreveUserId || null,
+        req.user.id,
+      ],
+    );
 
     res.json({ linked: true });
   } catch (e) {
     if (e instanceof CloudreveApiError && e.meta?.captchaRequired) {
       return res.status(428).json(e.meta);
     }
-    res.status(500).json({ error: e.message || "Cloudreve ensure failed" });
+    res.status(e.status || 500).json({
+      error: e.message || "Cloudreve ensure failed",
+    });
   }
 });
 
@@ -98,7 +171,10 @@ router.post("/register", async (req, res) => {
     }
 
     const pool = getPool();
-    const [existing] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
+    const [existing] = await pool.query(
+      "SELECT id FROM users WHERE email = ?",
+      [email],
+    );
     if (existing.length) {
       return res.status(409).json({ error: "Email already registered" });
     }
@@ -106,7 +182,7 @@ router.post("/register", async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
     const [result] = await pool.query(
       "INSERT INTO users (email, password_hash, name) VALUES (?, ?, ?)",
-      [email, passwordHash, name || null]
+      [email, passwordHash, name || null],
     );
 
     const user = { id: result.insertId, email, name: name || null };
@@ -127,7 +203,7 @@ router.post("/login", async (req, res) => {
 
     const [rows] = await pool.query(
       "SELECT id, email, password_hash, name FROM users WHERE email = ?",
-      [email]
+      [email],
     );
 
     if (!rows.length || !rows[0].password_hash) {
@@ -144,7 +220,7 @@ router.post("/login", async (req, res) => {
     res.json({
       token,
       user: { id: user.id, email: user.email, name: user.name },
-      cloudreveSetupRequired: true
+      cloudreveSetupRequired: true,
     });
   } catch (err) {
     console.error(err);
@@ -161,7 +237,7 @@ router.post("/google", async (req, res) => {
 
     const ticket = await googleClient.verifyIdToken({
       idToken: credential,
-      audience: process.env.GOOGLE_CLIENT_ID
+      audience: process.env.GOOGLE_CLIENT_ID,
     });
 
     const payload = ticket.getPayload();
@@ -171,7 +247,7 @@ router.post("/google", async (req, res) => {
 
     const [rows] = await pool.query(
       "SELECT id, email, name FROM users WHERE google_sub = ? OR email = ?",
-      [sub, email]
+      [sub, email],
     );
 
     let user;
@@ -180,13 +256,17 @@ router.post("/google", async (req, res) => {
       const existing = rows[0];
       await pool.query(
         "UPDATE users SET google_sub = ?, name = ?, picture_url = ? WHERE id = ?",
-        [sub, name || null, picture || null, existing.id]
+        [sub, name || null, picture || null, existing.id],
       );
-      user = { id: existing.id, email: existing.email, name: name || existing.name };
+      user = {
+        id: existing.id,
+        email: existing.email,
+        name: name || existing.name,
+      };
     } else {
       const [result] = await pool.query(
         "INSERT INTO users (email, google_sub, name, picture_url) VALUES (?, ?, ?, ?)",
-        [email, sub, name || null, picture || null]
+        [email, sub, name || null, picture || null],
       );
       user = { id: result.insertId, email, name: name || null };
     }
