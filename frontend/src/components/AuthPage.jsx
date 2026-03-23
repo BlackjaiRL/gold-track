@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { apiFetch, setToken, setUser } from "../api";
 
 export default function AuthPage({ onAuthSuccess }) {
@@ -7,23 +7,55 @@ export default function AuthPage({ onAuthSuccess }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState("");
+  const googleInitializedRef = useRef(false);
+
+  const googleClientId =
+    import.meta.env.VITE_GOOGLE_CLIENT_ID ||
+    "762224078192-tv7o5kl9e7u8841te2g0j7kvdd2q3jhl.apps.googleusercontent.com";
 
   useEffect(() => {
-    if (!window.google) return;
+    let cancelled = false;
 
-    window.google.accounts.id.initialize({
-      client_id: "762224078192-tv7o5kl9e7u8841te2g0j7kvdd2q3jhl.apps.googleusercontent.com",
-      callback: handleGoogleResponse
-    });
+    function tryInitGoogle() {
+      if (cancelled) return false;
+      if (googleInitializedRef.current) return true;
 
-    window.google.accounts.id.renderButton(
-      document.getElementById("googleSignInDiv"),
-      {
-        theme: "outline",
-        size: "large",
-        width: 260
+      const g = window.google?.accounts?.id;
+      if (!g) return false;
+
+      g.initialize({
+        client_id: googleClientId,
+        callback: handleGoogleResponse,
+      });
+
+      const el = document.getElementById("googleSignInDiv");
+      if (el) {
+        g.renderButton(el, {
+          theme: "outline",
+          size: "large",
+          width: 260,
+        });
       }
-    );
+
+      googleInitializedRef.current = true;
+      return true;
+    }
+
+    // The GIS script is loaded async/defer in index.html. On first render,
+    // window.google may not exist yet, so we poll briefly.
+    if (tryInitGoogle()) return;
+
+    const timer = setInterval(() => {
+      if (tryInitGoogle()) {
+        clearInterval(timer);
+      }
+    }, 200);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function handleGoogleResponse(response) {
@@ -32,13 +64,19 @@ export default function AuthPage({ onAuthSuccess }) {
       const data = await apiFetch("/auth/google", {
         method: "POST",
         body: JSON.stringify({
-          credential: response.credential
-        })
+          credential: response.credential,
+        }),
       });
 
       setToken(data.token);
       setUser(data.user);
-      setMessage("Google login successful");
+
+      setMessage(
+        data.cloudreveSetupRequired
+          ? "Google login successful. Storage setup required..."
+          : "Google login successful",
+      );
+
       onAuthSuccess();
     } catch (err) {
       setMessage(err.message);
@@ -53,18 +91,26 @@ export default function AuthPage({ onAuthSuccess }) {
 
       const path = mode === "login" ? "/auth/login" : "/auth/register";
       const body =
-        mode === "login"
-          ? { email, password }
-          : { name, email, password };
+        mode === "login" ? { email, password } : { name, email, password };
 
       const data = await apiFetch(path, {
         method: "POST",
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
       });
 
       setToken(data.token);
       setUser(data.user);
-      setMessage(mode === "login" ? "Login successful" : "Registration successful");
+
+      setMessage(
+        data.cloudreveSetupRequired
+          ? mode === "login"
+            ? "Login successful. Storage setup required..."
+            : "Registration successful. Storage setup required..."
+          : mode === "login"
+            ? "Login successful"
+            : "Registration successful",
+      );
+
       onAuthSuccess();
     } catch (err) {
       setMessage(err.message);

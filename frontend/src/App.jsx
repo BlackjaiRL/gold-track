@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import AuthPage from "./components/AuthPage";
 import Dashboard from "./components/Dashboard";
+import CloudreveGate from "./components/CloudreveGate";
 import { getToken, getUser, clearToken, clearUser } from "./api";
 
 export default function App() {
@@ -29,7 +30,9 @@ export default function App() {
       {!token ? (
         <AuthPage onAuthSuccess={handleAuthSuccess} />
       ) : (
-        <Dashboard user={user} onLogout={handleLogout} />
+        <CloudreveGate>
+          <Dashboard user={user} onLogout={handleLogout} />
+        </CloudreveGate>
       )}
     </div>
   );

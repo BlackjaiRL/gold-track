@@ -70,6 +70,7 @@ export default function Dashboard({ user, onLogout }) {
     }
   }
 
+
   useEffect(() => {
     loadGoldPrice();
     loadItems();
@@ -124,23 +125,10 @@ export default function Dashboard({ user, onLogout }) {
       const buyPriceUsd = +(enteredBuyPrice / exchangeRate).toFixed(2);
       formData.append("buyPriceTotal", buyPriceUsd);
 
-      const token = localStorage.getItem("token");
-
-      const response = await apiFetch("/items", {
+      await apiFetch("/items", {
         method: "POST",
         body: formData,
       });
-
-      let data = {};
-      try {
-        data = await response.json();
-      } catch {
-        data = {};
-      }
-
-      if (!response.ok) {
-        throw new Error(data.error || "Upload failed");
-      }
 
       setMessage(t("uploadSuccess"));
       setGrams("");

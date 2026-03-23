@@ -1,453 +1,496 @@
-// backend/src/services/cloudreve.js
 const axios = require("axios");
 const crypto = require("crypto");
-const { getPool } = require("../db/mysql");
 
 /**
- * Cloudreve v4 API wrapper.
- * Many endpoints return HTTP 200 with {code, msg, data} and use code!=0 for errors.
+ * Cloudreve v4 API helper + token lifecycle
+ * - Uses JSON API and Bearer tokens (NOT cookies).
+ * - Supports captcha types:
+ *   - "normal": fetch image+ticket from /site/captcha, send captcha+ticket to /user or /session/token
+ *   - "turnstile": send Turnstile token in captcha field, ticket is typically empty/omitted
+ *
+ * NOTE: Cloudreve deployments differ on base path. Some use /api/v4 prefix.
+ * Put the correct base in CLOUDREVE_BASE_URL, e.g.
+ *   https://files.example.com/api/v4
+ *   https://files.example.com
  */
+
+const BASE_URL = (process.env.CLOUDREVE_BASE_URL || "").replace(/\/+$/, "");
+if (!BASE_URL) {
+  console.warn("CLOUDREVE_BASE_URL is not configured");
+}
+
+// AES-256-GCM for credential encryption at rest
+const ENC_KEY_B64 = process.env.CLOUDREVE_CRED_ENC_KEY || "";
+const ENC_KEY = ENC_KEY_B64 ? Buffer.from(ENC_KEY_B64, "base64") : null;
+if (!ENC_KEY || ENC_KEY.length !== 32) {
+  console.warn(
+    "CLOUDREVE_CRED_ENC_KEY must be base64-encoded 32 bytes for AES-256-GCM",
+  );
+}
 
 class CloudreveApiError extends Error {
-  constructor(message, { httpStatus, code, response, step } = {}) {
+  constructor(message, { status, code, data, meta } = {}) {
     super(message);
     this.name = "CloudreveApiError";
-    this.httpStatus = httpStatus;
-    this.code = code;
-    this.response = response;
-    this.step = step;
+    this.status = status || 500;
+    this.code = typeof code === "number" ? code : null;
+    this.data = data;
+    this.meta = meta || null;
   }
 }
 
-function cloudreveBase() {
-  const base = process.env.CLOUDREVE_BASE_URL;
-  if (!base) throw new Error("Missing CLOUDREVE_BASE_URL");
-  return base.replace(/\/+$/, "");
-}
-
-function url(path) {
-  return `${cloudreveBase()}${path.startsWith("/") ? path : `/${path}`}`;
-}
-
-function parseCloudreveEnvelope(resp, step) {
-  const payload = resp?.data;
-  if (!payload || typeof payload !== "object") {
-    throw new CloudreveApiError("Invalid Cloudreve response", { step, httpStatus: resp?.status, response: payload });
+function encryptSecret(plain) {
+  if (!ENC_KEY) {
+    throw new Error("Missing CLOUDREVE_CRED_ENC_KEY");
   }
-  if (payload.code !== 0) {
-    throw new CloudreveApiError(payload.msg || "Cloudreve error", {
-      step,
-      httpStatus: resp?.status,
-      code: payload.code,
-      response: payload
-    });
-  }
-  return payload.data;
-}
-
-async function crRequest(method, path, { token, headers, data, responseType, timeout = 30000 } = {}) {
-  const h = { ...(headers || {}) };
-  if (token) h.Authorization = `Bearer ${token}`;
-
-  try {
-    const resp = await axios.request({
-      method,
-      url: url(path),
-      headers: h,
-      data,
-      timeout,
-      responseType
-    });
-    return resp;
-  } catch (err) {
-    const httpStatus = err.response?.status;
-    const response = err.response?.data;
-    throw new CloudreveApiError(err.message || "Cloudreve request failed", {
-      step: `http:${method}:${path}`,
-      httpStatus,
-      response
-    });
-  }
-}
-
-/**
- * AES-256-GCM encryption for Cloudreve passwords (at rest).
- * Env: CLOUDREVE_CRED_ENC_KEY must be base64(32 bytes).
- */
-function encKey() {
-  const b64 = process.env.CLOUDREVE_CRED_ENC_KEY;
-  if (!b64) throw new Error("Missing CLOUDREVE_CRED_ENC_KEY (base64, 32 bytes)");
-  const key = Buffer.from(b64, "base64");
-  if (key.length !== 32) throw new Error("CLOUDREVE_CRED_ENC_KEY must decode to 32 bytes");
-  return key;
-}
-
-function encryptString(plain) {
-  const key = encKey();
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
-  const ciphertext = Buffer.concat([cipher.update(String(plain), "utf8"), cipher.final()]);
+  const cipher = crypto.createCipheriv("aes-256-gcm", ENC_KEY, iv);
+  const enc = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return `v1:${iv.toString("base64")}:${tag.toString("base64")}:${ciphertext.toString("base64")}`;
+
+  // Format: v1:<ivB64>:<tagB64>:<cipherB64>
+  return [
+    "v1",
+    iv.toString("base64"),
+    tag.toString("base64"),
+    enc.toString("base64"),
+  ].join(":");
 }
 
-function decryptString(enc) {
+function decryptSecret(enc) {
+  if (!ENC_KEY) {
+    throw new Error("Missing CLOUDREVE_CRED_ENC_KEY");
+  }
   if (!enc) return null;
-  const [v, ivB64, tagB64, dataB64] = String(enc).split(":");
-  if (v !== "v1") throw new Error("Unsupported credential format");
-  const key = encKey();
-  const iv = Buffer.from(ivB64, "base64");
-  const tag = Buffer.from(tagB64, "base64");
-  const data = Buffer.from(dataB64, "base64");
+  const parts = enc.split(":");
+  if (parts.length !== 4 || parts[0] !== "v1") {
+    throw new Error("Unsupported encrypted secret format");
+  }
+  const iv = Buffer.from(parts[1], "base64");
+  const tag = Buffer.from(parts[2], "base64");
+  const cipherText = Buffer.from(parts[3], "base64");
 
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", ENC_KEY, iv);
   decipher.setAuthTag(tag);
-  const plain = Buffer.concat([decipher.update(data), decipher.final()]);
+  const plain = Buffer.concat([decipher.update(cipherText), decipher.final()]);
   return plain.toString("utf8");
 }
 
-function toMysqlDatetime(d) {
-  if (!d) return null;
-  const dt = new Date(d);
-  if (Number.isNaN(dt.getTime())) return null;
-  return dt.toISOString().slice(0, 19).replace("T", " ");
+function isProbablyNetworkErr(err) {
+  return (
+    err.code === "ECONNREFUSED" ||
+    err.code === "ECONNRESET" ||
+    err.code === "ETIMEDOUT" ||
+    err.code === "ENOTFOUND"
+  );
 }
 
-function isExpired(mysqlDt, skewSeconds = 30) {
-  if (!mysqlDt) return true;
-  const t = new Date(mysqlDt).getTime();
-  return t <= Date.now() + skewSeconds * 1000;
+async function crRequest(
+  method,
+  path,
+  { token, headers, data, responseType } = {},
+) {
+  try {
+    const url = `${BASE_URL}${path}`;
+    const resp = await axios({
+      method,
+      url,
+      data,
+      headers: {
+        ...(headers || {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      responseType: responseType || "json",
+      validateStatus: () => true,
+    });
+
+    if (resp.status >= 200 && resp.status < 300) {
+      return resp;
+    }
+
+    // Try parse error response
+    const msg =
+      resp.data?.msg || resp.data?.error || "Cloudreve request failed";
+
+    throw new CloudreveApiError(msg, {
+      status: resp.status,
+      code: resp.data?.code,
+      data: resp.data,
+    });
+  } catch (err) {
+    if (err instanceof CloudreveApiError) throw err;
+    if (isProbablyNetworkErr(err)) {
+      throw new CloudreveApiError(`Cloudreve network error: ${err.message}`, {
+        status: 502,
+      });
+    }
+    throw new CloudreveApiError(err.message || "Cloudreve request error", {
+      status: 500,
+    });
+  }
 }
 
-/** --- Cloudreve API methods --- */
+/**
+ * Cloudreve envelope format observed:
+ * { code: 0, data: ..., msg: "" }
+ */
+function parseCloudreveEnvelope(resp) {
+  const body = resp?.data;
+  if (!body || typeof body !== "object") {
+    throw new CloudreveApiError("Invalid Cloudreve response", { status: 502 });
+  }
+  if (typeof body.code === "number" && body.code !== 0) {
+    throw new CloudreveApiError(body.msg || body.error || "Cloudreve error", {
+      status: 400,
+      code: body.code,
+      data: body,
+    });
+  }
+  return body.data;
+}
+
+// ---- Site config / captcha -------------------------------------------------
 
 async function getSiteConfigBasic(token) {
   const resp = await crRequest("GET", "/site/config/basic", { token });
-  return parseCloudreveEnvelope(resp, "site_config_basic");
+  return parseCloudreveEnvelope(resp);
 }
 
 async function getCaptcha() {
   const resp = await crRequest("GET", "/site/captcha");
-  // data: {image, ticket}
-  return parseCloudreveEnvelope(resp, "captcha");
+  return parseCloudreveEnvelope(resp); // { image, ticket }
 }
 
-async function signUp({ email, password, language = "en-US", captcha, ticket }) {
-  const body = { email, password, language };
-  if (captcha != null) body.captcha = captcha;
-  if (ticket != null) body.ticket = ticket;
+// ---- Auth ------------------------------------------------------------------
 
+/**
+ * POST /user
+ * Body:
+ * - email, password, language
+ * - captcha, ticket (optional/required depending on config)
+ */
+async function signUp({ email, password, language, captcha, ticket }) {
   const resp = await crRequest("POST", "/user", {
-    headers: { "Content-Type": "application/json" },
-    data: body
+    data: { email, password, language, captcha, ticket },
   });
-  return parseCloudreveEnvelope(resp, "signup");
+  return parseCloudreveEnvelope(resp); // user object
 }
 
+/**
+ * POST /session/token
+ * Body:
+ * - email, password
+ * - captcha, ticket (optional/required depending on config)
+ */
 async function passwordSignIn({ email, password, captcha, ticket }) {
-  const body = { email, password };
-  if (captcha != null) body.captcha = captcha;
-  if (ticket != null) body.ticket = ticket;
-
   const resp = await crRequest("POST", "/session/token", {
-    headers: { "Content-Type": "application/json" },
-    data: body
+    data: { email, password, captcha, ticket },
   });
-  // data: {user, token}
-  return parseCloudreveEnvelope(resp, "password_sign_in");
+  return parseCloudreveEnvelope(resp); // { user, token }
 }
 
-async function finish2FA({ opt, session_id }) {
-  const resp = await crRequest("POST", "/session/token/2fa", {
-    headers: { "Content-Type": "application/json" },
-    data: { opt, session_id }
-  });
-  return parseCloudreveEnvelope(resp, "2fa_finish");
-}
-
+/**
+ * POST /session/token/refresh
+ */
 async function refreshToken(refresh_token) {
   const resp = await crRequest("POST", "/session/token/refresh", {
-    headers: { "Content-Type": "application/json" },
-    data: { refresh_token }
+    data: { refresh_token },
   });
-  // data: {access_token, refresh_token, access_expires, refresh_expires}
-  return parseCloudreveEnvelope(resp, "refresh_token");
+  return parseCloudreveEnvelope(resp); // { access_token, refresh_token, access_expires, refresh_expires }
 }
 
-async function createFile({ token, type, uri, err_on_conflict = false }) {
+/**
+ * Ensures a Cloudreve account exists for this app user.
+ * - If user has no cloudreve_password_enc, create an account (signUp) with a generated password.
+ * - If captchas required (reg_captcha/login_captcha), return meta for frontend.
+ *
+ * Returns:
+ * { created: boolean, cloudreveEmail, cloudrevePasswordEnc, cloudreveUserId, captchaRequired?, captchaType?, cfg?, captcha? }
+ */
+async function ensureCloudreveAccount({
+  appEmail,
+  appName,
+  existingCloudrevePasswordEnc,
+  captcha,
+  ticket,
+}) {
+  if (existingCloudrevePasswordEnc) {
+    return {
+      created: false,
+      cloudreveEmail: appEmail,
+      cloudrevePasswordEnc: existingCloudrevePasswordEnc,
+    };
+  }
+
+  const cfg = await getSiteConfigBasic();
+  const captchaType = cfg.captcha_type || "normal";
+  const regCaptcha = !!cfg.reg_captcha;
+  const loginCaptcha = !!cfg.login_captcha;
+
+  // If Cloudreve requires captcha for registration and we don't have it, return requirement
+  if (regCaptcha && !captcha) {
+    if (captchaType === "normal") {
+      const cap = await getCaptcha();
+      return {
+        created: false,
+        captchaRequired: true,
+        captchaType,
+        cfg,
+        captcha: { image: cap.image, ticket: cap.ticket },
+      };
+    }
+
+    // turnstile/recaptcha/etc: frontend must render provider and submit captcha token
+    return {
+      created: false,
+      captchaRequired: true,
+      captchaType,
+      cfg,
+    };
+  }
+
+  const generatedPassword = crypto.randomBytes(24).toString("base64url");
+  const language = "en-US";
+  const user = await signUp({
+    email: appEmail,
+    password: generatedPassword,
+    language,
+    captcha,
+    ticket,
+  });
+
+  // If Cloudreve requires email activation, status may be inactive
+  if (user?.status && user.status !== "active") {
+    return {
+      created: true,
+      requiresActivation: true,
+      cloudreveEmail: appEmail,
+      cloudrevePasswordEnc: encryptSecret(generatedPassword),
+      cloudreveUserId: user.id || null,
+      status: user.status,
+    };
+  }
+
+  return {
+    created: true,
+    cloudreveEmail: appEmail,
+    cloudrevePasswordEnc: encryptSecret(generatedPassword),
+    cloudreveUserId: user.id || null,
+  };
+}
+
+/**
+ * Ensures we have a valid access token.
+ * If access token expired:
+ * - try refresh using refresh token
+ * - if refresh fails, attempt password login (may require captcha)
+ *
+ * Returns:
+ * { accessToken, accessExpiresAt, refreshToken, refreshExpiresAt, cloudreveUserId? }
+ */
+async function ensureAccessToken({
+  cloudreveEmail,
+  cloudrevePasswordEnc,
+  accessToken,
+  accessExpiresAt,
+  refreshToken: storedRefreshToken,
+  refreshExpiresAt,
+  captcha,
+  ticket,
+}) {
+  if (!cloudreveEmail || !cloudrevePasswordEnc) {
+    throw new CloudreveApiError("Missing Cloudreve credentials", {
+      status: 400,
+    });
+  }
+
+  const now = Date.now();
+
+  // If access token still valid for at least 60 seconds, use it
+  if (accessToken && accessExpiresAt) {
+    const expMs =
+      typeof accessExpiresAt === "number"
+        ? accessExpiresAt
+        : new Date(accessExpiresAt).getTime();
+    if (expMs - now > 60 * 1000) {
+      return {
+        accessToken,
+        accessExpiresAt: new Date(expMs).toISOString(),
+        refreshToken: storedRefreshToken,
+        refreshExpiresAt:
+          refreshExpiresAt instanceof Date
+            ? refreshExpiresAt.toISOString()
+            : refreshExpiresAt,
+      };
+    }
+  }
+
+  // Try refresh token if present and not expired
+  if (storedRefreshToken && refreshExpiresAt) {
+    const rExpMs =
+      typeof refreshExpiresAt === "number"
+        ? refreshExpiresAt
+        : new Date(refreshExpiresAt).getTime();
+    if (rExpMs - now > 60 * 1000) {
+      try {
+        const t = await refreshToken(storedRefreshToken);
+        return {
+          accessToken: t.access_token,
+          accessExpiresAt: t.access_expires,
+          refreshToken: t.refresh_token,
+          refreshExpiresAt: t.refresh_expires,
+        };
+      } catch (err) {
+        // fallthrough to password login
+      }
+    }
+  }
+
+  // Password login fallback (may require captcha)
+  const cfg = await getSiteConfigBasic();
+  const captchaType = cfg.captcha_type || "normal";
+  const loginCaptcha = !!cfg.login_captcha;
+
+  if (loginCaptcha && !captcha) {
+    if (captchaType === "normal") {
+      const cap = await getCaptcha();
+      throw new CloudreveApiError("Captcha required", {
+        status: 428,
+        meta: {
+          captchaRequired: true,
+          captchaType,
+          cfg,
+          captcha: { image: cap.image, ticket: cap.ticket },
+        },
+      });
+    }
+
+    throw new CloudreveApiError("Captcha required", {
+      status: 428,
+      meta: { captchaRequired: true, captchaType, cfg },
+    });
+  }
+
+  const plainPassword = decryptSecret(cloudrevePasswordEnc);
+
+  const login = await passwordSignIn({
+    email: cloudreveEmail,
+    password: plainPassword,
+    captcha,
+    ticket,
+  });
+
+  return {
+    accessToken: login.token.access_token,
+    accessExpiresAt: login.token.access_expires,
+    refreshToken: login.token.refresh_token,
+    refreshExpiresAt: login.token.refresh_expires,
+    cloudreveUserId: login.user?.id || null,
+  };
+}
+
+// ---- File APIs -------------------------------------------------------------
+
+async function createFile({ token, type, uri, err_on_conflict }) {
   const resp = await crRequest("POST", "/file/create", {
     token,
-    headers: { "Content-Type": "application/json" },
-    data: { type, uri, err_on_conflict }
+    data: { type, uri, err_on_conflict: !!err_on_conflict },
   });
-  return parseCloudreveEnvelope(resp, "file_create");
+  return parseCloudreveEnvelope(resp);
 }
 
-async function createUploadSession({ token, uri, size, policy_id, last_modified, mime_type, encryption_supported }) {
-  const body = { uri, size, policy_id, last_modified, mime_type };
-  if (encryption_supported) body.encryption_supported = encryption_supported;
-
+async function createUploadSession({
+  token,
+  uri,
+  size,
+  policy_id,
+  last_modified,
+  mime_type,
+}) {
   const resp = await crRequest("PUT", "/file/upload", {
     token,
-    headers: { "Content-Type": "application/json" },
-    data: body
+    data: {
+      uri,
+      size,
+      policy_id,
+      last_modified,
+      mime_type,
+    },
   });
-  return parseCloudreveEnvelope(resp, "upload_session");
+  return parseCloudreveEnvelope(resp);
 }
 
-async function uploadChunk({ token, sessionId, index, buffer }) {
-  const resp = await crRequest("POST", `/file/upload/${encodeURIComponent(sessionId)}/${index}`, {
-    token,
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "Content-Length": buffer.length
+async function uploadFileChunk({
+  token,
+  sessionId,
+  index,
+  chunkBuffer,
+  contentType = "application/octet-stream",
+}) {
+  const resp = await crRequest(
+    "POST",
+    `/file/upload/${encodeURIComponent(sessionId)}/${index}`,
+    {
+      token,
+      data: chunkBuffer,
+      headers: { "Content-Type": contentType },
     },
-    data: buffer,
-    timeout: 120000
-  });
-  parseCloudreveEnvelope(resp, "upload_chunk");
-  return true;
+  );
+  // chunk upload returns {code:0,msg:""} (no data)
+  parseCloudreveEnvelope(resp);
 }
 
 async function createDirectLinks({ token, uris }) {
   const resp = await crRequest("PUT", "/file/source", {
     token,
-    headers: { "Content-Type": "application/json" },
-    data: { uris }
+    data: { uris },
   });
-  return parseCloudreveEnvelope(resp, "direct_links");
+  return parseCloudreveEnvelope(resp); // [{link,file_url},...]
 }
 
-async function createDownloadUrls({ token, uris, archive = false }) {
-  const resp = await crRequest("POST", "/file/url", {
-    token,
-    headers: { "Content-Type": "application/json" },
-    data: { uris, archive }
-  });
-  return parseCloudreveEnvelope(resp, "download_urls");
-}
-
-async function deleteFiles({ token, uris, unlink = false, skip_soft_delete = true }) {
+async function deleteFile({
+  token,
+  uris,
+  unlink = false,
+  skip_soft_delete = true,
+}) {
   const resp = await crRequest("DELETE", "/file", {
     token,
-    headers: { "Content-Type": "application/json" },
-    data: { uris, unlink, skip_soft_delete }
+    data: { uris, unlink: !!unlink, skip_soft_delete: !!skip_soft_delete },
   });
-  parseCloudreveEnvelope(resp, "delete_files");
-  return true;
+  // returns {code:0,msg:""}
+  parseCloudreveEnvelope(resp);
 }
 
-/** --- Higher-level: per-app-user linking and token management --- */
-
-function randomPassword() {
-  return crypto.randomBytes(24).toString("base64url");
-}
-
-async function loadUserForCloudreve(userId) {
-  const pool = getPool();
-  const [rows] = await pool.query(
-    `SELECT
-       id, email,
-       cloudreve_email, cloudreve_password_enc, cloudreve_user_id,
-       cloudreve_access_token, cloudreve_access_expires_at,
-       cloudreve_refresh_token, cloudreve_refresh_expires_at,
-       cloudreve_connected_at
-     FROM users WHERE id = ?`,
-    [userId]
-  );
-  if (!rows.length) throw new Error("User not found");
-  return rows[0];
-}
-
-async function saveCloudreveAuth(userId, { cloudreve_email, cloudreve_password_enc, cloudreve_user_id, token }) {
-  const pool = getPool();
-  await pool.query(
-    `UPDATE users SET
-       cloudreve_email = ?,
-       cloudreve_password_enc = ?,
-       cloudreve_user_id = ?,
-       cloudreve_access_token = ?,
-       cloudreve_access_expires_at = ?,
-       cloudreve_refresh_token = ?,
-       cloudreve_refresh_expires_at = ?,
-       cloudreve_connected_at = IF(cloudreve_connected_at IS NULL, NOW(), cloudreve_connected_at)
-     WHERE id = ?`,
-    [
-      cloudreve_email || null,
-      cloudreve_password_enc || null,
-      cloudreve_user_id || null,
-      token?.access_token || null,
-      toMysqlDatetime(token?.access_expires) || null,
-      token?.refresh_token || null,
-      toMysqlDatetime(token?.refresh_expires) || null,
-      userId
-    ]
-  );
-}
-
-/**
- * Ensure Cloudreve account exists for this app user.
- * If captcha is required and missing, return an object with captchaRequired=true.
- */
-async function ensureCloudreveAccount(userId, { captcha, ticket } = {}) {
-  const u = await loadUserForCloudreve(userId);
-  const cfg = await getSiteConfigBasic(); // may include captcha_type and keys
-
-  // register/login flags may be omitted if false (omitempty); default false
-  const registerEnabled = !!cfg.register_enabled;
-  const regCaptcha = !!cfg.reg_captcha;
-  const loginCaptcha = !!cfg.login_captcha;
-  const captchaType = cfg.captcha_type || null;
-
-  // If already linked, just return
-  if (u.cloudreve_email && u.cloudreve_password_enc) {
-    return { linked: true, captchaType, cfg };
-  }
-
-  if (!registerEnabled) {
-    return { linked: false, reason: "Cloudreve registration disabled", captchaType, cfg };
-  }
-
-  // If registration captcha is enabled and captcha missing, signal to UI
-  if (regCaptcha && !captcha) {
-    // For "normal" we can provide image+ticket; for other types, UI uses sitekey.
-    if (captchaType === "normal") {
-      const cap = await getCaptcha();
-      return {
-        linked: false,
-        captchaRequired: true,
-        captchaType,
-        cfg,
-        captcha: { image: cap.image, ticket: cap.ticket }
-      };
-    }
-    return { linked: false, captchaRequired: true, captchaType, cfg };
-  }
-
-  // Decision: use the app user's email as Cloudreve email to avoid collisions and activation delivery ambiguity.
-  const cloudEmail = u.email;
-  const cloudPass = randomPassword();
-
-  // Attempt sign up
-  let created;
-  try {
-    created = await signUp({
-      email: cloudEmail,
-      password: cloudPass,
-      language: "en-US",
-      captcha,
-      ticket
-    });
-  } catch (e) {
-    // If user exists already, we cannot recover without knowing their password.
-    // Keep the failure explicit to avoid silent mis-linking.
-    throw e;
-  }
-
-  // If account returned inactive, caller may need to handle activation.
-  if (created?.status && created.status !== "active") {
-    return { linked: false, reason: `Cloudreve account status: ${created.status}`, requiresActivation: true, cfg };
-  }
-
-  // Login to obtain tokens
-  const loginResp = await passwordSignIn({ email: cloudEmail, password: cloudPass, captcha, ticket });
-  const tokenObj = loginResp.token;
-  await saveCloudreveAuth(userId, {
-    cloudreve_email: cloudEmail,
-    cloudreve_password_enc: encryptString(cloudPass),
-    cloudreve_user_id: loginResp.user?.id,
-    token: tokenObj
+async function createDownloadUrl({ token, uris, archive = false }) {
+  const resp = await crRequest("POST", "/file/url", {
+    token,
+    data: { uris, archive: !!archive },
   });
-
-  return { linked: true, captchaType, cfg };
+  return parseCloudreveEnvelope(resp); // {urls:[{url}], expires}
 }
 
-/**
- * Ensure valid access token for user; refresh if possible; fallback to login if needed.
- * If fallback login is necessary and captcha is required, caller should surface that to UI.
- */
-async function ensureAccessToken(userId, { captcha, ticket } = {}) {
-  const u = await loadUserForCloudreve(userId);
+// ---- Export ----------------------------------------------------------------
 
-  // Access token still valid?
-  if (u.cloudreve_access_token && !isExpired(u.cloudreve_access_expires_at, 60)) {
-    return u.cloudreve_access_token;
-  }
-
-  // Refresh token valid?
-  if (u.cloudreve_refresh_token && !isExpired(u.cloudreve_refresh_expires_at, 60)) {
-    const tok = await refreshToken(u.cloudreve_refresh_token);
-    // refresh endpoint returns token pair at data root
-    await saveCloudreveAuth(userId, {
-      cloudreve_email: u.cloudreve_email,
-      cloudreve_password_enc: u.cloudreve_password_enc,
-      cloudreve_user_id: u.cloudreve_user_id,
-      token: tok
-    });
-    return tok.access_token;
-  }
-
-  // Need login (may require captcha)
-  if (!u.cloudreve_email || !u.cloudreve_password_enc) {
-    throw new CloudreveApiError("Cloudreve account not linked", { step: "ensureAccessToken" });
-  }
-
-  const cfg = await getSiteConfigBasic();
-  const loginCaptcha = !!cfg.login_captcha;
-  const captchaType = cfg.captcha_type || null;
-
-  if (loginCaptcha && !captcha) {
-    if (captchaType === "normal") {
-      const cap = await getCaptcha();
-      const err = new CloudreveApiError("Captcha required", { step: "ensureAccessToken" });
-      err.meta = { captchaRequired: true, captchaType, cfg, captcha: cap };
-      throw err;
-    }
-    const err = new CloudreveApiError("Captcha required", { step: "ensureAccessToken" });
-    err.meta = { captchaRequired: true, captchaType, cfg };
-    throw err;
-  }
-
-  const pass = decryptString(u.cloudreve_password_enc);
-  const loginResp = await passwordSignIn({
-    email: u.cloudreve_email,
-    password: pass,
-    captcha,
-    ticket
-  });
-
-  await saveCloudreveAuth(userId, {
-    cloudreve_email: u.cloudreve_email,
-    cloudreve_password_enc: u.cloudreve_password_enc,
-    cloudreve_user_id: loginResp.user?.id,
-    token: loginResp.token
-  });
-
-  return loginResp.token.access_token;
-}
-
-/**
- * Convenience: wrapper that doesn't require auth header (JWT Optional) for config.
- */
 async function getSiteConfigBasicUnauthed() {
-  const resp = await crRequest("GET", "/site/config/basic");
-  return parseCloudreveEnvelope(resp, "site_config_basic");
+  return getSiteConfigBasic();
 }
 
 module.exports = {
   CloudreveApiError,
+  encryptSecret,
+  decryptSecret,
+
   getSiteConfigBasic: getSiteConfigBasicUnauthed,
   getCaptcha,
-  signUp,
-  passwordSignIn,
-  finish2FA,
-  refreshToken,
+
+  ensureCloudreveAccount,
+  ensureAccessToken,
+
   createFile,
   createUploadSession,
-  uploadChunk,
+  uploadFileChunk,
   createDirectLinks,
-  createDownloadUrls,
-  deleteFiles,
-  ensureCloudreveAccount,
-  ensureAccessToken
+  createDownloadUrl,
+  deleteFile,
 };
