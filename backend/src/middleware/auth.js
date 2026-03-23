@@ -1,7 +1,6 @@
 const jwt = require("jsonwebtoken");
 
 function requireAuth(req, res, next) {
-  console.log("Authorization header:", req.headers.authorization);
   const authHeader = req.headers.authorization || "";
   const token = authHeader.startsWith("Bearer ")
     ? authHeader.slice(7)
