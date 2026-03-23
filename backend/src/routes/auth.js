@@ -62,6 +62,8 @@ router.get("/cloudreve/captcha", async (_req, res) => {
  */
 router.post("/cloudreve/ensure", requireAuth, async (req, res) => {
   try {
+    console.log("CLOUDREVE ENSURE body:", req.body);
+    console.log("CLOUDREVE ENSURE headers:", req.headers);
     const { captcha, ticket } = req.body || {};
     const pool = getPool();
 
