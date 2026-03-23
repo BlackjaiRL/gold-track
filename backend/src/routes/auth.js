@@ -67,12 +67,12 @@ router.post("/cloudreve/ensure", requireAuth, async (req, res) => {
 
     const [rows] = await pool.query(
       `SELECT email, name,
-              cloudreve_email, cloudreve_password_enc, cloudreve_user_id,
+              cloudreve_email, cloudreve_password_enc,
               cloudreve_access_token, cloudreve_access_expires_at,
               cloudreve_refresh_token, cloudreve_refresh_expires_at
        FROM users
        WHERE id = ?`,
-      [req.user.id],
+      [req.user.id]
     );
 
     if (!rows.length) {
@@ -94,30 +94,30 @@ router.post("/cloudreve/ensure", requireAuth, async (req, res) => {
       return res.status(428).json(ensureResult);
     }
 
-    // save newly created Cloudreve account credentials
+    // 新建立帳號時先把帳密存起來
     if (ensureResult.created && ensureResult.cloudrevePasswordEnc) {
       await pool.query(
         `UPDATE users
          SET cloudreve_email = ?,
-             cloudreve_password_enc = ?,
-             cloudreve_user_id = COALESCE(cloudreve_user_id, ?)
+             cloudreve_password_enc = ?
          WHERE id = ?`,
         [
           ensureResult.cloudreveEmail,
           ensureResult.cloudrevePasswordEnc,
-          ensureResult.cloudreveUserId || null,
           req.user.id,
-        ],
+        ]
       );
-    }
 
-    if (ensureResult.requiresActivation) {
-      return res.status(428).json({
-        linked: false,
-        requiresActivation: true,
-        reason: ensureResult.reason || "Activation required",
-        cfg: ensureResult.cfg || null,
-      });
+      // 關鍵：不要立刻用同一個 turnstile token 再登入一次
+      // 如果 login captcha 有開，要求前端重新驗證一次
+      const cfg = await getSiteConfigBasic();
+      if (cfg?.login_captcha) {
+        return res.status(428).json({
+          captchaRequired: true,
+          captchaType: cfg.captcha_type || "normal",
+          cfg,
+        });
+      }
     }
 
     const latestPasswordEnc =
@@ -139,17 +139,15 @@ router.post("/cloudreve/ensure", requireAuth, async (req, res) => {
        SET cloudreve_access_token = ?,
            cloudreve_access_expires_at = ?,
            cloudreve_refresh_token = ?,
-           cloudreve_refresh_expires_at = ?,
-           cloudreve_user_id = COALESCE(cloudreve_user_id, ?)
+           cloudreve_refresh_expires_at = ?
        WHERE id = ?`,
       [
         tokens.accessToken,
         tokens.accessExpiresAt,
         tokens.refreshToken,
         tokens.refreshExpiresAt,
-        tokens.cloudreveUserId || null,
         req.user.id,
-      ],
+      ]
     );
 
     res.json({ linked: true });
