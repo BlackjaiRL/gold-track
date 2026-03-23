@@ -245,8 +245,12 @@ export default function CloudreveSetupModal({
               <button
                 type="button"
                 className="primary-btn"
-                disabled={!captchaText || !ticket}
-                onClick={() => onSubmit({ captcha: captchaText, ticket })}
+                disabled={!turnstileToken}
+                onClick={() => {
+                  const token = turnstileToken;
+                  setTurnstileToken("");
+                  onSubmit({ captcha: token, ticket: "" });
+                }}
               >
                 Continue
               </button>
